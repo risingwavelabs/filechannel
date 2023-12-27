@@ -1,0 +1,1215 @@
+// Copyright 2023 RisingWave Labs
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package filechannel
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"io"
+	"math"
+	"os"
+	"path"
+	"regexp"
+	"slices"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/elliotchance/orderedmap/v2"
+	"github.com/gofrs/flock"
+	"github.com/klauspost/compress/snappy"
+
+	"github.com/arkbriar/filechannel/internal/condvar"
+	"github.com/arkbriar/filechannel/internal/fs"
+	"github.com/arkbriar/filechannel/internal/utils"
+)
+
+type SegmentFileState int
+
+const (
+	Plain SegmentFileState = iota
+	Compressing
+	Compressed
+)
+
+const MessageHeaderBinarySize = 8
+
+type MessageHeader struct {
+	Length   uint32
+	Checksum uint32
+}
+
+func (h *MessageHeader) Encode(b []byte) {
+	if len(b) < MessageHeaderBinarySize {
+		panic("buffer size not large enough")
+	}
+	binary.BigEndian.PutUint32(b[:4], h.Length)
+	binary.BigEndian.PutUint32(b[4:8], h.Checksum)
+}
+
+func (h *MessageHeader) Decode(b []byte) {
+	if len(b) < MessageHeaderBinarySize {
+		panic("buffer size not large enough")
+	}
+	h.Length = binary.BigEndian.Uint32(b[:4])
+	h.Checksum = binary.BigEndian.Uint32(b[4:8])
+}
+
+const SegmentHeaderBinarySize = 64
+
+type PlainSegmentHeader struct {
+	SegmentID   uint32
+	BeginOffset uint64
+}
+
+func (h *PlainSegmentHeader) Decode(b []byte) {
+	if len(b) < SegmentHeaderBinarySize {
+		panic("buffer size not large enough")
+	}
+	h.SegmentID = binary.BigEndian.Uint32(b[:4])
+	h.BeginOffset = binary.BigEndian.Uint64(b[4:12])
+}
+
+func (h *PlainSegmentHeader) Encode(b []byte) {
+	if len(b) < SegmentHeaderBinarySize {
+		panic("buffer size not large enough")
+	}
+	binary.BigEndian.PutUint32(b[:4], h.SegmentID)
+	binary.BigEndian.PutUint64(b[4:12], h.BeginOffset)
+}
+
+type CompressionMethod byte
+
+const (
+	Snappy CompressionMethod = iota
+)
+
+type CompressedSegmentHeader struct {
+	SegmentID         uint32
+	BeginOffset       uint64
+	EndOffset         uint64
+	CompressionMethod CompressionMethod
+}
+
+func (h *CompressedSegmentHeader) Decode(b []byte) {
+	if len(b) < SegmentHeaderBinarySize {
+		panic("buffer size not large enough")
+	}
+
+	h.SegmentID = binary.BigEndian.Uint32(b[:4])
+	h.BeginOffset = binary.BigEndian.Uint64(b[4:12])
+	h.EndOffset = binary.BigEndian.Uint64(b[12:20])
+	h.CompressionMethod = CompressionMethod(b[20])
+}
+
+func (h *CompressedSegmentHeader) Encode(b []byte) {
+	if len(b) < SegmentHeaderBinarySize {
+		panic("buffer size not large enough")
+	}
+	binary.BigEndian.PutUint32(b[:4], h.SegmentID)
+	binary.BigEndian.PutUint64(b[4:12], h.BeginOffset)
+	binary.BigEndian.PutUint64(b[12:20], h.EndOffset)
+	b[20] = byte(h.CompressionMethod)
+}
+
+const (
+	IteratorBufferLimit = 1 << 20
+)
+
+type Iterator struct {
+	segmentManager *SegmentManager
+	position       *Position
+
+	writeOffset  uint64 // local copy of write offset
+	offset       uint64
+	segmentIndex uint32
+	f            *fs.SequentialFile
+	r            io.Reader
+
+	lastErr error
+	buf     *bytes.Buffer
+}
+
+func (it *Iterator) updateOffset(offset uint64) error {
+	if it.offset == math.MaxUint64 {
+		it.offset = offset
+	} else if it.offset != offset {
+		return errors.New("broken of continuity")
+	}
+	return nil
+}
+
+func (it *Iterator) openCompressedFile() error {
+	file := it.segmentManager.SegmentFile(it.segmentIndex, Compressed)
+	f, err := fs.OpenSequentialFile(file)
+	if err != nil {
+		return err
+	}
+	var buf [SegmentHeaderBinarySize]byte
+	if _, err = f.Read(buf[:]); err != nil {
+		err1 := f.Close()
+		return errors.Join(err, err1)
+	}
+
+	header := &CompressedSegmentHeader{}
+	header.Decode(buf[:])
+	err = it.updateOffset(header.BeginOffset)
+	if err != nil {
+		err1 := f.Close()
+		return errors.Join(err, err1)
+	}
+
+	it.f, it.r = f, snappy.NewReader(f)
+	return nil
+}
+
+func (it *Iterator) openPlainFile() error {
+	file := it.segmentManager.SegmentFile(it.segmentIndex, Plain)
+	f, err := fs.OpenSequentialFile(file)
+	if err != nil {
+		return err
+	}
+	var buf [SegmentHeaderBinarySize]byte
+	if _, err = f.Read(buf[:]); err != nil {
+		err1 := f.Close()
+		return errors.Join(err, err1)
+	}
+
+	header := &PlainSegmentHeader{}
+	header.Decode(buf[:])
+	err = it.updateOffset(header.BeginOffset)
+	if err != nil {
+		err1 := f.Close()
+		return errors.Join(err, err1)
+	}
+
+	it.f, it.r = f, f
+	return nil
+}
+
+func (it *Iterator) openFile() error {
+	err := it.openCompressedFile()
+	if os.IsNotExist(err) {
+		return it.openPlainFile()
+	}
+	return err
+}
+
+func (it *Iterator) closeFile() error {
+	err := it.f.Close()
+	it.f, it.r = nil, nil
+	return err
+}
+
+func (it *Iterator) ensure() error {
+	if it.f == nil {
+		return it.openFile()
+	}
+	return nil
+}
+
+var (
+	ErrUnexpectedEOF    = fmt.Errorf("unexpected EOF")
+	ErrChecksumMismatch = errors.New("channel corrupted: checksum mismatch")
+	ErrChannelClosed    = errors.New("channel closed")
+)
+
+func ReadNext(r io.Reader, w io.Writer) error {
+	var hBuf [MessageHeaderBinarySize]byte
+	n, err := io.ReadFull(r, hBuf[:])
+	if err != nil {
+		if err == io.EOF {
+			if n == 0 {
+				return io.EOF
+			} else {
+				return ErrUnexpectedEOF
+			}
+		}
+		return err
+	}
+	h := &MessageHeader{}
+	h.Decode(hBuf[:])
+
+	// Grow the buffer to avoid multiple allocations.
+	if buf, ok := w.(*bytes.Buffer); ok {
+		buf.Grow(int(h.Length))
+		start := buf.Len()
+		_, err = io.CopyN(buf, r, int64(h.Length))
+		if err != nil {
+			return err
+		}
+		if crc32.ChecksumIEEE(buf.Bytes()[start:]) != h.Checksum {
+			return ErrChecksumMismatch
+		}
+	} else {
+		cw := utils.NewChecksumWriter(w)
+		_, err = io.CopyN(cw, r, int64(h.Length))
+		if err != nil {
+			return err
+		}
+
+		if cw.Checksum() != h.Checksum {
+			return ErrChecksumMismatch
+		}
+	}
+
+	return err
+}
+
+func (it *Iterator) readNext() ([]byte, error) {
+	err := ReadNext(it.r, it.buf)
+	if err != nil {
+		return nil, err
+	}
+
+	it.offset += uint64(MessageHeaderBinarySize) + uint64(it.buf.Len())
+	msg := it.buf.Bytes()
+
+	// If buffer size exceeds the limit, allocate a new one. The current one
+	// will be returned to the caller.
+	if it.buf.Cap() > IteratorBufferLimit {
+		it.buf = bytes.NewBuffer(make([]byte, 0, IteratorBufferLimit))
+	} else {
+		it.buf.Reset()
+	}
+
+	return msg, nil
+}
+
+func (it *Iterator) Next(ctx context.Context) (b []byte, err error) {
+	defer func() {
+		//goland:noinspection GoDirectComparisonOfErrors
+		if err != nil && err != ctx.Err() {
+			it.lastErr = err
+		}
+	}()
+	if it.lastErr != nil {
+		return nil, it.lastErr
+	}
+
+	// Initialize the offset.
+	if it.offset == math.MaxUint64 {
+		if err = it.ensure(); err != nil {
+			return nil, err
+		}
+	}
+
+	if it.offset >= it.writeOffset {
+		writeOffset, err := it.position.Wait(ctx, func(writeOffset uint64) bool {
+			return it.offset < writeOffset
+		})
+		if err != nil {
+			return nil, err
+		}
+		it.writeOffset = writeOffset
+	}
+
+	loopCount := 0
+	for {
+		if err = it.ensure(); err != nil {
+			return nil, err
+		}
+
+		// If loop count > 1, that means there were some empty segment files skipped.
+		// That is technically possible but should not happen in real.
+		if loopCount > 1 {
+			panic("unexpected loop count")
+		}
+
+		b, err = it.readNext()
+
+		// Handle end of file: move to next segment.
+		if err == io.EOF {
+			if err := it.closeFile(); err != nil {
+				return nil, err
+			}
+			it.segmentIndex, _ = it.segmentManager.AdvanceReader(it.segmentIndex)
+			loopCount++
+			continue
+		}
+
+		return b, err
+	}
+}
+
+func (it *Iterator) Close() error {
+	it.segmentManager.CloseReader(it.segmentIndex)
+	it.lastErr = errors.New("closed")
+	return it.closeFile()
+}
+
+func NewIterator(manager *SegmentManager, position *Position) *Iterator {
+	return &Iterator{
+		segmentManager: manager,
+		position:       position,
+		offset:         math.MaxUint64,
+		segmentIndex:   manager.NewReader(),
+		buf:            bytes.NewBuffer(make([]byte, 0, 4096)),
+	}
+}
+
+type Position struct {
+	mu     sync.RWMutex
+	cond   *condvar.Cond
+	offset uint64
+	closed bool
+}
+
+func (p *Position) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.closed = true
+	p.cond.Broadcast()
+}
+
+func (p *Position) Update(offset uint64) uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if offset > p.offset {
+		p.offset = offset
+		defer p.cond.Broadcast()
+	}
+	return p.offset
+}
+
+func (p *Position) Wait(ctx context.Context, cond func(uint64) bool) (uint64, error) {
+	p.mu.RLock()
+	for !p.closed && !cond(p.offset) {
+		err := p.cond.WaitContext(ctx)
+		if err != nil {
+			return 0, err
+		}
+	}
+	defer p.mu.RUnlock()
+
+	if cond(p.offset) {
+		return p.offset, nil
+	} else { // p.closed == true
+		return 0, ErrChannelClosed
+	}
+}
+
+func NewPosition(offset uint64) *Position {
+	pos := &Position{offset: offset}
+	pos.cond = condvar.NewCond(pos.mu.RLocker())
+	return pos
+}
+
+type SegmentManager struct {
+	dir string
+
+	beginIndex uint32
+
+	writeMu sync.RWMutex
+	index   uint32
+
+	readMu       sync.RWMutex
+	readCond     *condvar.Cond
+	pinFreq      *orderedmap.OrderedMap[uint32, int]
+	readFreq     *orderedmap.OrderedMap[uint32, int]
+	maxReadIndex int64
+	watermark    uint32
+}
+
+func (sm *SegmentManager) GetBeginIndex() uint32 {
+	return sm.beginIndex
+}
+
+func (sm *SegmentManager) SetBeginIndex(index uint32) {
+	sm.beginIndex = index
+}
+
+func (sm *SegmentManager) NewReader() uint32 {
+	sm.readMu.Lock()
+	defer sm.readMu.Unlock()
+
+	beginIndex := sm.watermark
+	sm.readFreq.Set(beginIndex, sm.readFreq.GetOrDefault(beginIndex, 0)+1)
+	return beginIndex
+}
+
+func (sm *SegmentManager) Pin(index uint32) bool {
+	sm.readMu.Lock()
+	defer sm.readMu.Unlock()
+
+	if index >= sm.watermark {
+		sm.pinFreq.Set(index, sm.pinFreq.GetOrDefault(index, 0)+1)
+		return true
+	}
+
+	return false
+}
+
+func (sm *SegmentManager) Unpin(index uint32) {
+	sm.readMu.Lock()
+	defer sm.readMu.Unlock()
+
+	v, ok := sm.pinFreq.Get(index)
+	if !ok {
+		panic("unpin non-existing segment")
+	}
+	isFront := sm.pinFreq.Front().Key == index
+
+	if v == 1 {
+		sm.pinFreq.Delete(index)
+	} else {
+		sm.pinFreq.Set(index, v-1)
+	}
+
+	if isFront && v == 1 {
+		sm.updateWatermark()
+	}
+}
+
+func (sm *SegmentManager) updateWatermark() {
+	prevWatermark := sm.watermark
+
+	readFreqEmpty := sm.readFreq.Len() == 0
+	pinFreqEmpty := sm.pinFreq.Len() == 0
+	if readFreqEmpty && pinFreqEmpty {
+		sm.watermark = uint32(sm.maxReadIndex + 1)
+	} else if readFreqEmpty {
+		sm.watermark = sm.pinFreq.Front().Key
+	} else if pinFreqEmpty {
+		sm.watermark = sm.readFreq.Front().Key
+	} else {
+		sm.watermark = min(sm.pinFreq.Front().Key, sm.readFreq.Front().Key)
+	}
+
+	if prevWatermark != sm.watermark {
+		sm.readCond.Broadcast()
+	}
+}
+
+func (sm *SegmentManager) AdvanceReader(prev uint32) (uint32, uint32) {
+	sm.readMu.Lock()
+	defer sm.readMu.Unlock()
+
+	sm.maxReadIndex = max(int64(prev), sm.maxReadIndex)
+
+	v, ok := sm.readFreq.Get(prev)
+	if !ok {
+		panic("advancing a non-existing reader")
+	}
+	isFront := sm.readFreq.Front().Key == prev
+
+	if v == 1 {
+		sm.readFreq.Delete(prev)
+	} else {
+		sm.readFreq.Set(prev, v-1)
+	}
+	sm.readFreq.Set(prev+1, sm.readFreq.GetOrDefault(prev+1, 0)+1)
+
+	// If the minimum reader index is deleted, there's a chance to
+	// advance the watermark.
+	if isFront && v == 1 {
+		sm.updateWatermark()
+	}
+
+	return prev + 1, sm.watermark
+}
+
+func (sm *SegmentManager) CloseReader(cur uint32) uint32 {
+	sm.readMu.Lock()
+	defer sm.readMu.Unlock()
+
+	sm.maxReadIndex = max(int64(cur), sm.maxReadIndex)
+
+	v, ok := sm.readFreq.Get(cur)
+	if !ok {
+		panic("closing a non-existing reader")
+	}
+	isFront := sm.readFreq.Front().Key == cur
+
+	if v == 1 {
+		sm.readFreq.Delete(cur)
+	} else {
+		sm.readFreq.Set(cur, v-1)
+	}
+
+	// If the minimum reader index is deleted, there's a chance to
+	// advance the watermark.
+	if isFront && v == 1 {
+		sm.updateWatermark()
+	}
+
+	return sm.watermark
+}
+
+func (sm *SegmentManager) segmentFile(index uint32, state SegmentFileState) string {
+	switch state {
+	case Plain:
+		return fmt.Sprintf("segment.%d", index)
+	case Compressing:
+		return fmt.Sprintf("segment.%d.z.ing", index)
+	case Compressed:
+		return fmt.Sprintf("segment.%d.z", index)
+	}
+	panic("invalid state: " + strconv.Itoa(int(state)))
+}
+
+func (sm *SegmentManager) SegmentFile(index uint32, state SegmentFileState) string {
+	return path.Join(sm.dir, sm.segmentFile(index, state))
+}
+
+var segmentFilePattern = regexp.MustCompile("^segment\\.([0-9]+)(\\.\\S+)?$")
+
+func ParseSegmentIndexAndState(file string) (uint32, SegmentFileState, error) {
+	matches := segmentFilePattern.FindStringSubmatch(path.Base(file))
+	if len(matches) == 0 {
+		return 0, 0, errors.New("unrecognized segment")
+	}
+	if len(matches) >= 2 {
+		idx, err := strconv.ParseUint(matches[1], 10, 32)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to parse segment index: %w", err)
+		}
+
+		switch matches[2] {
+		case "":
+			return uint32(idx), Plain, nil
+		case ".z":
+			return uint32(idx), Compressed, nil
+		case ".z.ing":
+			return uint32(idx), Compressing, nil
+		default:
+			return 0, 0, errors.New("unrecognized file state")
+		}
+	}
+	panic("unreachable")
+}
+
+func (sm *SegmentManager) CurrentSegmentWatermark() uint32 {
+	sm.readMu.RLock()
+	defer sm.readMu.RUnlock()
+
+	return sm.watermark
+}
+
+func (sm *SegmentManager) WaitUntilWatermarkAbove(ctx context.Context, index uint32) (uint32, error) {
+	sm.readMu.RLock()
+
+	for sm.watermark <= index {
+		err := sm.readCond.WaitContext(ctx)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	defer sm.readMu.RUnlock()
+	return sm.watermark, nil
+}
+
+func (sm *SegmentManager) CurrentSegmentIndex() uint32 {
+	sm.writeMu.RLock()
+	defer sm.writeMu.RUnlock()
+
+	return sm.index
+}
+
+func (sm *SegmentManager) IncSegmentIndex() uint32 {
+	sm.writeMu.Lock()
+	defer sm.writeMu.Unlock()
+
+	sm.index++
+	return sm.index
+}
+
+func NewSegmentManager(dir string) *SegmentManager {
+	sm := &SegmentManager{
+		dir:          dir,
+		readFreq:     orderedmap.NewOrderedMap[uint32, int](),
+		pinFreq:      orderedmap.NewOrderedMap[uint32, int](),
+		maxReadIndex: -1,
+	}
+	cond := condvar.NewCond(sm.readMu.RLocker())
+	sm.readCond = cond
+	return sm
+}
+
+type FileChannel struct {
+	dir            string
+	segmentManager *SegmentManager
+	position       *Position
+	fileLock       *flock.Flock
+
+	flushInterval   time.Duration
+	rotateThreshold uint64
+
+	lastErr  error
+	closed   bool
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	bgWg     sync.WaitGroup
+
+	mu            sync.Mutex
+	beginOffset   uint64
+	currentOffset uint64
+	f             *fs.AppendableFile
+}
+
+var (
+	DefaultFlushInterval   = 100 * time.Microsecond // 100us
+	DefaultRotateThreshold = uint64(512 << 20)      // 512 MB
+)
+
+type Option func(*FileChannel)
+
+func FlushInterval(d time.Duration) Option {
+	if d < time.Microsecond {
+		panic("flush interval is too small")
+	}
+	return func(channel *FileChannel) {
+		channel.flushInterval = d
+	}
+}
+
+func RotateThreshold(n uint64) Option {
+	return func(channel *FileChannel) {
+		channel.rotateThreshold = n
+	}
+}
+
+func NewFileChannel(dir string, opts ...Option) *FileChannel {
+	ctx, cancel := context.WithCancel(context.Background())
+	fc := &FileChannel{
+		dir:             dir,
+		segmentManager:  NewSegmentManager(dir),
+		flushInterval:   DefaultFlushInterval,
+		rotateThreshold: DefaultRotateThreshold,
+		bgCtx:           ctx,
+		bgCancel:        cancel,
+	}
+
+	for _, opt := range opts {
+		opt(fc)
+	}
+
+	return fc
+}
+
+func OpenFileChannel(dir string, opts ...Option) (*FileChannel, error) {
+	fc := NewFileChannel(dir, opts...)
+	err := fc.Open()
+	if err != nil {
+		return nil, err
+	}
+	return fc, nil
+}
+
+func readCompressedSegmentHeader(file string) (CompressedSegmentHeader, error) {
+	f, err := fs.OpenSequentialFile(file)
+	if err != nil {
+		return CompressedSegmentHeader{}, err
+	}
+	defer f.Close()
+
+	var hBuf [SegmentHeaderBinarySize]byte
+	_, err = f.Read(hBuf[:])
+	if err != nil {
+		return CompressedSegmentHeader{}, err
+	}
+
+	h := CompressedSegmentHeader{}
+	h.Decode(hBuf[:])
+
+	return h, nil
+}
+
+func repairPlainSegment(file string) (PlainSegmentHeader, uint64, error) {
+	f, err := fs.OpenSequentialFile(file)
+	if err != nil {
+		return PlainSegmentHeader{}, 0, err
+	}
+	defer f.Close()
+
+	var hBuf [SegmentHeaderBinarySize]byte
+	_, err = f.Read(hBuf[:])
+	if err != nil {
+		return PlainSegmentHeader{}, 0, err
+	}
+
+	h := PlainSegmentHeader{}
+	h.Decode(hBuf[:])
+
+	lastOffset := uint64(0)
+	discard := utils.NewCountWriter(io.Discard)
+	for {
+		err = ReadNext(f, discard)
+		if err == nil {
+			lastOffset = discard.Count()
+		} else if err == io.EOF {
+			lastOffset = discard.Count()
+			break
+		} else if errors.Is(err, ErrUnexpectedEOF) ||
+			errors.Is(err, ErrChecksumMismatch) {
+			// Truncate to the last offset.
+			err := os.Truncate(file, int64(lastOffset)+SegmentHeaderBinarySize)
+			if err != nil {
+				return PlainSegmentHeader{}, 0, fmt.Errorf("failed to truncate: %w", err)
+			}
+			break
+		} else {
+			// Unrecoverable.
+			return PlainSegmentHeader{}, 0, err
+		}
+	}
+
+	return h, lastOffset + h.BeginOffset, nil
+}
+
+func (fc *FileChannel) probeWritingFileAndInit(lastIndex uint32, states []SegmentFileState) error {
+	fc.segmentManager.index = lastIndex
+
+	if slices.Contains(states, Compressed) {
+		h, err := readCompressedSegmentHeader(fc.segmentManager.SegmentFile(lastIndex, Compressed))
+		if err != nil {
+			return err
+		}
+		fc.position = NewPosition(h.EndOffset)
+		fc.currentOffset = h.EndOffset
+		fc.beginOffset = h.EndOffset
+
+		fc.segmentManager.IncSegmentIndex()
+
+		return fc.createSegmentFile()
+	} else {
+		h, endOffset, err := repairPlainSegment(fc.segmentManager.SegmentFile(lastIndex, Plain))
+		if err != nil {
+			return err
+		}
+		fc.position = NewPosition(endOffset)
+		fc.currentOffset = endOffset
+		fc.beginOffset = h.BeginOffset
+
+		f, err := fs.OpenAppendableFile(fc.segmentManager.SegmentFile(lastIndex, Plain), 0644)
+		if err != nil {
+			return err
+		}
+		fc.f = f
+
+		return nil
+	}
+}
+
+func (fc *FileChannel) tryLock() error {
+	if fc.fileLock != nil {
+		return errors.New("already opened")
+	}
+	fileLock := flock.New(path.Join(fc.dir, "lock"))
+	locked, err := fileLock.TryLock()
+	if err != nil {
+		return fmt.Errorf("failed to lock: %w", err)
+	}
+	if !locked {
+		return errors.New("failed to locked, other process is using the channel")
+	}
+	fc.fileLock = fileLock
+	return nil
+}
+
+func (fc *FileChannel) unlock() error {
+	return fc.fileLock.Unlock()
+}
+
+func (fc *FileChannel) Open() error {
+	if err := fc.tryLock(); err != nil {
+		return err
+	}
+
+	d, err := os.Open(fc.dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+
+	entries, err := d.ReadDir(-1)
+	if err != nil {
+		return err
+	}
+
+	segmentFiles := make(map[uint32][]SegmentFileState)
+	lowestIndex, highestIndex := uint32(math.MaxUint32), uint32(0)
+	for _, et := range entries {
+		if et.IsDir() {
+			continue
+		}
+		index, state, err := ParseSegmentIndexAndState(et.Name())
+		if err == nil {
+			// Remove compressing files.
+			if state == Compressing {
+				err := forceRemoveFile(path.Join(fc.dir, et.Name()))
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			segmentFiles[index] = append(segmentFiles[index], state)
+			if index < lowestIndex {
+				lowestIndex = index
+			}
+			if index > highestIndex {
+				highestIndex = index
+			}
+		}
+	}
+
+	if len(segmentFiles) > 0 && len(segmentFiles) != int(highestIndex-lowestIndex+1) {
+		return errors.New("file channel corrupted: segments missing")
+	}
+
+	if len(segmentFiles) == 0 {
+		fc.position = NewPosition(0)
+		if err := fc.createSegmentFile(); err != nil {
+			return err
+		}
+		fc.segmentManager.beginIndex = 0
+		fc.segmentManager.watermark = 0
+	} else {
+		if err := fc.probeWritingFileAndInit(highestIndex, segmentFiles[highestIndex]); err != nil {
+			return err
+		}
+		fc.segmentManager.beginIndex = lowestIndex
+		fc.segmentManager.watermark = lowestIndex
+	}
+
+	toCompress := make([]uint32, 0, 4)
+	for index, states := range segmentFiles {
+		slices.Sort(states)
+		switch {
+		case slices.Equal(states, []SegmentFileState{Plain, Compressed}):
+			_ = os.Remove(fc.segmentManager.SegmentFile(index, Plain))
+		case slices.Equal(states, []SegmentFileState{Plain}):
+			if index != fc.segmentManager.CurrentSegmentIndex() {
+				toCompress = append(toCompress, index)
+			}
+		case slices.Equal(states, []SegmentFileState{Compressed}):
+		default:
+			return fmt.Errorf("unrecognized states: %+v", states)
+		}
+	}
+
+	// Start background tasks.
+	fc.bgWg.Add(1)
+	go func() {
+		defer fc.bgWg.Done()
+		fc.flushAndNotifyLoop(fc.bgCtx)
+	}()
+	for _, idx := range toCompress {
+		fc.bgWg.Add(1)
+		cIdx := idx
+		go func() {
+			defer fc.bgWg.Done()
+			_ = fc.compress(fc.bgCtx, cIdx)
+		}()
+	}
+	fc.bgWg.Add(1)
+	go func() {
+		defer fc.bgWg.Done()
+		fc.gcLoop(fc.bgCtx)
+	}()
+
+	return nil
+}
+
+func (fc *FileChannel) compress(ctx context.Context, index uint32) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	if !fc.segmentManager.Pin(index) {
+		return fmt.Errorf("failed to pin segment index %d", index)
+	}
+	defer fc.segmentManager.Unpin(index)
+
+	plainFile := fc.segmentManager.SegmentFile(index, Plain)
+	compressingFile := fc.segmentManager.SegmentFile(index, Compressing)
+
+	stats, err := os.Stat(plainFile)
+	if err != nil {
+		return fmt.Errorf("failed to get stats of plain segment file: %w", err)
+	}
+
+	f, err := fs.OpenSequentialFile(plainFile)
+	if err != nil {
+		return fmt.Errorf("failed to open plain segment file: %w", err)
+	}
+	defer f.Close()
+
+	wf, err := fs.OpenFile(compressingFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open compressing segment file: %w", err)
+	}
+	defer wf.Close()
+
+	var buf [SegmentHeaderBinarySize]byte
+	// Read plain file header.
+	plainHeader := PlainSegmentHeader{}
+	if _, err := f.Read(buf[:]); err != nil {
+		return fmt.Errorf("failed to read plain segment header: %w", err)
+	}
+	plainHeader.Decode(buf[:])
+
+	// Write compressed file header.
+	compressedHeader := CompressedSegmentHeader{
+		SegmentID:         index,
+		BeginOffset:       plainHeader.BeginOffset,
+		EndOffset:         plainHeader.BeginOffset + uint64(stats.Size()-SegmentHeaderBinarySize),
+		CompressionMethod: Snappy,
+	}
+	compressedHeader.Encode(buf[:])
+	_, err = wf.Write(buf[:])
+	if err != nil {
+		return fmt.Errorf("failed to write compressed segment header: %w", err)
+	}
+
+	// Copy.
+	w := snappy.NewBufferedWriter(wf)
+
+	_, err = io.Copy(w, f)
+	if err != nil {
+		return fmt.Errorf("failed to compress: %w", err)
+	}
+	err = w.Close()
+	if err != nil {
+		return fmt.Errorf("failed to compress: %w", err)
+	}
+
+	// Rename and delete the original file.
+	err = os.Rename(compressingFile, fc.segmentManager.SegmentFile(index, Compressed))
+	if err != nil {
+		return fmt.Errorf("failed to rename: %w", err)
+	}
+
+	_ = os.Remove(plainFile)
+	return nil
+}
+
+func (fc *FileChannel) Close() error {
+	if fc.fileLock == nil {
+		return errors.New("not opened")
+	}
+
+	_ = fc.flushAndNotify()
+	fc.position.Close()
+
+	fc.closed = true
+	fc.bgCancel()
+	fc.bgWg.Wait()
+	err := fc.f.Close()
+	fc.f = nil
+
+	_ = fc.fileLock.Unlock()
+	fc.fileLock = nil
+
+	return err
+}
+
+func forceRemoveFile(f string) error {
+	err := os.Remove(f)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func (fc *FileChannel) gcForIndex(index uint32) error {
+	err1 := forceRemoveFile(fc.segmentManager.SegmentFile(index, Plain))
+	err2 := forceRemoveFile(fc.segmentManager.SegmentFile(index, Compressed))
+	return errors.Join(err1, err2)
+}
+
+func (fc *FileChannel) gcOnce(watermark uint32) {
+	beginIndex := fc.segmentManager.GetBeginIndex()
+	for index := beginIndex; index < watermark; index++ {
+		_ = fc.gcForIndex(index)
+	}
+	fc.segmentManager.SetBeginIndex(watermark)
+}
+
+func (fc *FileChannel) gcLoop(ctx context.Context) {
+	watermark := fc.segmentManager.CurrentSegmentWatermark()
+	fc.gcOnce(watermark)
+
+	for {
+		nextWatermark, err := fc.segmentManager.WaitUntilWatermarkAbove(ctx, watermark)
+		if err != nil {
+			return
+		}
+		fc.gcOnce(nextWatermark)
+		watermark = nextWatermark
+	}
+}
+
+func (fc *FileChannel) flushAndNotifyLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(fc.flushInterval):
+			// FIXME: log the error
+			_ = fc.flushAndNotifyWithLock()
+		}
+	}
+}
+
+func (fc *FileChannel) flushAndNotifyWithLock() error {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	return fc.flushAndNotify()
+}
+
+func (fc *FileChannel) flushAndNotify() error {
+	err := fc.f.Flush()
+	if err != nil {
+		return err
+	}
+	fc.position.Update(fc.currentOffset)
+
+	return nil
+}
+
+func (fc *FileChannel) needsRotate() bool {
+	return fc.currentOffset-fc.beginOffset >= fc.rotateThreshold
+}
+
+func (fc *FileChannel) createSegmentFile() error {
+	file := fc.segmentManager.SegmentFile(fc.segmentManager.CurrentSegmentIndex(), Plain)
+	f, err := fs.OpenAppendableFile(file, 0644)
+	if err != nil {
+		return err
+	}
+
+	// Write header.
+	var hBuf [SegmentHeaderBinarySize]byte
+	h := PlainSegmentHeader{
+		SegmentID:   fc.segmentManager.CurrentSegmentIndex(),
+		BeginOffset: fc.currentOffset,
+	}
+	h.Encode(hBuf[:])
+	_, err = f.Write(hBuf[:])
+	if err != nil {
+		err1 := f.Close()
+		return errors.Join(err, err1)
+	}
+
+	// Flush to persist.
+	if err := f.Flush(); err != nil {
+		err1 := f.Close()
+		return errors.Join(err, err1)
+	}
+
+	fc.beginOffset = fc.currentOffset
+	fc.f = f
+	return nil
+}
+
+func (fc *FileChannel) rotate() error {
+	err := fc.flushAndNotify()
+	if err != nil {
+		return err
+	}
+
+	err = fc.f.Close()
+	if err != nil {
+		return err
+	}
+
+	curIndex := fc.segmentManager.CurrentSegmentIndex()
+
+	// Seal the current one, and start compressing the previous one.
+	// This is an optimization to save CPU cost when throughput of reading
+	// and writing are almost equal so that when rotation happens, there
+	// won't be compression on the file that reader is reading, and it provides
+	// an opportunity for the GC removing a file before compressed.
+	if curIndex > 0 {
+		fc.bgWg.Add(1)
+		go func() {
+			defer fc.bgWg.Done()
+			// FIXME: log the error
+			_ = fc.compress(fc.bgCtx, curIndex-1)
+		}()
+	}
+
+	fc.segmentManager.IncSegmentIndex()
+	return fc.createSegmentFile()
+}
+
+func (fc *FileChannel) Write(p []byte) (err error) {
+	defer func() {
+		if err != nil {
+			fc.lastErr = err
+		}
+	}()
+
+	if fc.lastErr != nil {
+		return fc.lastErr
+	}
+
+	if fc.closed {
+		return errors.New("closed")
+	}
+
+	// Construct header.
+	header := MessageHeader{
+		Length:   uint32(len(p)),
+		Checksum: crc32.ChecksumIEEE(p),
+	}
+	var headerBuf [MessageHeaderBinarySize]byte
+	header.Encode(headerBuf[:])
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	// If the segment size exceeds the threshold, seal and rotate to the next file.
+	if fc.needsRotate() {
+		if err := fc.rotate(); err != nil {
+			return err
+		}
+	}
+
+	// Write header + payload.
+	_, err = fc.f.Write(headerBuf[:])
+	if err != nil {
+		return err
+	}
+	_, err = fc.f.Write(p)
+	if err != nil {
+		return err
+	}
+
+	fc.currentOffset += uint64(MessageHeaderBinarySize + len(p))
+
+	return nil
+}
+
+func (fc *FileChannel) Flush() error {
+	return fc.flushAndNotifyWithLock()
+}
+
+func (fc *FileChannel) Iterator() *Iterator {
+	if fc.closed {
+		panic("file channel closed")
+	}
+	return NewIterator(fc.segmentManager, fc.position)
+}
