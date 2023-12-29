@@ -40,6 +40,14 @@ import (
 	"github.com/arkbriar/filechannel/internal/utils"
 )
 
+var (
+	ErrUnexpectedEOF      = fmt.Errorf("unexpected EOF")
+	ErrChecksumMismatch   = errors.New("channel corrupted: checksum mismatch")
+	ErrChannelClosed      = errors.New("channel closed")
+	ErrNotEnoughMessages  = errors.New("not enough messages")
+	ErrNotEnoughReadToAck = errors.New("not enough read to ack")
+)
+
 type SegmentFileState int
 
 const (
@@ -142,6 +150,11 @@ type Iterator struct {
 	f            *fs.SequentialFile
 	r            io.Reader
 
+	autoAck         bool
+	readerIndex     uint32
+	pendingAckCount int
+	pendingAck      *orderedmap.OrderedMap[uint32, int]
+
 	lastErr error
 	buf     *bytes.Buffer
 }
@@ -224,12 +237,6 @@ func (it *Iterator) ensure() error {
 	return nil
 }
 
-var (
-	ErrUnexpectedEOF    = fmt.Errorf("unexpected EOF")
-	ErrChecksumMismatch = errors.New("channel corrupted: checksum mismatch")
-	ErrChannelClosed    = errors.New("channel closed")
-)
-
 func ReadNext(r io.Reader, w io.Writer) error {
 	var hBuf [MessageHeaderBinarySize]byte
 	n, err := io.ReadFull(r, hBuf[:])
@@ -278,6 +285,8 @@ func (it *Iterator) readNext() ([]byte, error) {
 		return nil, err
 	}
 
+	it.pendingAckCount++
+	it.pendingAck.Set(it.segmentIndex, it.pendingAck.GetOrDefault(it.segmentIndex, 0)+1)
 	it.offset += uint64(MessageHeaderBinarySize) + uint64(it.buf.Len())
 	msg := it.buf.Bytes()
 
@@ -292,10 +301,65 @@ func (it *Iterator) readNext() ([]byte, error) {
 	return msg, nil
 }
 
+func (it *Iterator) Ack(n int) error {
+	if it.pendingAckCount < n {
+		return ErrNotEnoughReadToAck
+	}
+	it.pendingAckCount -= n
+
+	f := it.pendingAck.Front()
+
+	for n > 0 {
+		if n >= f.Value {
+			n -= f.Value
+			it.pendingAck.Delete(f.Key)
+			f = it.pendingAck.Front()
+		} else {
+			f.Value -= n
+			n = 0
+		}
+	}
+
+	curSegmentIndex := it.segmentIndex
+	if f != nil {
+		curSegmentIndex = f.Key
+	}
+
+	if curSegmentIndex > it.readerIndex {
+		it.readerIndex, _ = it.segmentManager.AdvanceReader(it.readerIndex, curSegmentIndex-it.readerIndex)
+	}
+
+	return nil
+}
+
+func (it *Iterator) waitForData(ctx context.Context) error {
+	if it.offset >= it.writeOffset {
+		writeOffset, err := it.position.Wait(ctx, func(writeOffset uint64) bool {
+			return it.offset < writeOffset
+		})
+		if err != nil {
+			return err
+		}
+		it.writeOffset = writeOffset
+	}
+	return nil
+}
+
+func (it *Iterator) TryNext() ([]byte, error) {
+	return it.tryNext(nil)
+}
+
 func (it *Iterator) Next(ctx context.Context) (b []byte, err error) {
+	return it.tryNext(ctx)
+}
+
+func (it *Iterator) tryNext(ctx context.Context) (b []byte, err error) {
 	defer func() {
 		//goland:noinspection GoDirectComparisonOfErrors
-		if err != nil && err != ctx.Err() {
+		if err != nil && err != ErrNotEnoughMessages {
+			if ctx != nil && err == ctx.Err() {
+				return
+			}
 			it.lastErr = err
 		}
 	}()
@@ -310,14 +374,17 @@ func (it *Iterator) Next(ctx context.Context) (b []byte, err error) {
 		}
 	}
 
-	if it.offset >= it.writeOffset {
-		writeOffset, err := it.position.Wait(ctx, func(writeOffset uint64) bool {
-			return it.offset < writeOffset
-		})
-		if err != nil {
+	if ctx == nil {
+		if it.offset >= it.writeOffset {
+			it.writeOffset = it.position.Get()
+			if it.offset >= it.writeOffset {
+				return nil, ErrNotEnoughMessages
+			}
+		}
+	} else {
+		if err := it.waitForData(ctx); err != nil {
 			return nil, err
 		}
-		it.writeOffset = writeOffset
 	}
 
 	loopCount := 0
@@ -339,9 +406,13 @@ func (it *Iterator) Next(ctx context.Context) (b []byte, err error) {
 			if err := it.closeFile(); err != nil {
 				return nil, err
 			}
-			it.segmentIndex, _ = it.segmentManager.AdvanceReader(it.segmentIndex)
+			it.segmentIndex++
 			loopCount++
 			continue
+		}
+
+		if err == nil && it.autoAck {
+			_ = it.Ack(1)
 		}
 
 		return b, err
@@ -349,18 +420,22 @@ func (it *Iterator) Next(ctx context.Context) (b []byte, err error) {
 }
 
 func (it *Iterator) Close() error {
-	it.segmentManager.CloseReader(it.segmentIndex)
+	it.segmentManager.CloseReader(it.readerIndex)
 	it.lastErr = errors.New("closed")
 	return it.closeFile()
 }
 
-func NewIterator(manager *SegmentManager, position *Position) *Iterator {
+func NewIterator(manager *SegmentManager, position *Position, autoAck bool) *Iterator {
+	reader := manager.NewReader()
 	return &Iterator{
 		segmentManager: manager,
 		position:       position,
 		offset:         math.MaxUint64,
-		segmentIndex:   manager.NewReader(),
+		segmentIndex:   reader,
+		readerIndex:    reader,
 		buf:            bytes.NewBuffer(make([]byte, 0, 4096)),
+		autoAck:        autoAck,
+		pendingAck:     orderedmap.NewOrderedMap[uint32, int](),
 	}
 }
 
@@ -386,6 +461,12 @@ func (p *Position) Update(offset uint64) uint64 {
 		p.offset = offset
 		defer p.cond.Broadcast()
 	}
+	return p.offset
+}
+
+func (p *Position) Get() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.offset
 }
 
@@ -498,11 +579,9 @@ func (sm *SegmentManager) updateWatermark() {
 	}
 }
 
-func (sm *SegmentManager) AdvanceReader(prev uint32) (uint32, uint32) {
+func (sm *SegmentManager) AdvanceReader(prev uint32, delta uint32) (uint32, uint32) {
 	sm.readMu.Lock()
 	defer sm.readMu.Unlock()
-
-	sm.maxReadIndex = max(int64(prev), sm.maxReadIndex)
 
 	v, ok := sm.readFreq.Get(prev)
 	if !ok {
@@ -515,7 +594,10 @@ func (sm *SegmentManager) AdvanceReader(prev uint32) (uint32, uint32) {
 	} else {
 		sm.readFreq.Set(prev, v-1)
 	}
-	sm.readFreq.Set(prev+1, sm.readFreq.GetOrDefault(prev+1, 0)+1)
+
+	next := prev + delta
+	sm.maxReadIndex = max(int64(next-1), sm.maxReadIndex)
+	sm.readFreq.Set(next, sm.readFreq.GetOrDefault(next, 0)+1)
 
 	// If the minimum reader index is deleted, there's a chance to
 	// advance the watermark.
@@ -523,14 +605,12 @@ func (sm *SegmentManager) AdvanceReader(prev uint32) (uint32, uint32) {
 		sm.updateWatermark()
 	}
 
-	return prev + 1, sm.watermark
+	return next, sm.watermark
 }
 
 func (sm *SegmentManager) CloseReader(cur uint32) uint32 {
 	sm.readMu.Lock()
 	defer sm.readMu.Unlock()
-
-	sm.maxReadIndex = max(int64(cur), sm.maxReadIndex)
 
 	v, ok := sm.readFreq.Get(cur)
 	if !ok {
@@ -749,27 +829,28 @@ func repairPlainSegment(file string) (PlainSegmentHeader, uint64, error) {
 	h := PlainSegmentHeader{}
 	h.Decode(hBuf[:])
 
-	lastOffset := uint64(0)
+	lastReadCount := uint64(0)
 	discard := utils.NewCountWriter(io.Discard)
+	msgCnt := 0
 	for {
 		err = ReadNext(f, discard)
-		if err == nil {
-			lastOffset = discard.Count()
-		} else if err == io.EOF {
-			lastOffset = discard.Count()
+		if err != nil {
 			break
-		} else if errors.Is(err, ErrUnexpectedEOF) ||
-			errors.Is(err, ErrChecksumMismatch) {
-			// Truncate to the last offset.
-			err := os.Truncate(file, int64(lastOffset)+SegmentHeaderBinarySize)
-			if err != nil {
-				return PlainSegmentHeader{}, 0, fmt.Errorf("failed to truncate: %w", err)
-			}
-			break
-		} else {
-			// Unrecoverable.
-			return PlainSegmentHeader{}, 0, err
 		}
+		msgCnt++
+		lastReadCount = discard.Count()
+	}
+
+	lastOffset := lastReadCount + uint64(msgCnt*MessageHeaderBinarySize)
+	if errors.Is(err, ErrUnexpectedEOF) || errors.Is(err, ErrChecksumMismatch) {
+		// Truncate to the last offset.
+		err := os.Truncate(file, int64(lastOffset)+SegmentHeaderBinarySize)
+		if err != nil {
+			return PlainSegmentHeader{}, 0, fmt.Errorf("failed to truncate: %w", err)
+		}
+	} else if err != io.EOF {
+		// Unrecoverable.
+		return PlainSegmentHeader{}, 0, err
 	}
 
 	return h, lastOffset + h.BeginOffset, nil
@@ -1211,5 +1292,12 @@ func (fc *FileChannel) Iterator() *Iterator {
 	if fc.closed {
 		panic("file channel closed")
 	}
-	return NewIterator(fc.segmentManager, fc.position)
+	return NewIterator(fc.segmentManager, fc.position, true)
+}
+
+func (fc *FileChannel) IteratorAcknowledgable() *Iterator {
+	if fc.closed {
+		panic("file channel closed")
+	}
+	return NewIterator(fc.segmentManager, fc.position, false)
 }

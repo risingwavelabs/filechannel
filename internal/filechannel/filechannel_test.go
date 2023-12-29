@@ -22,11 +22,15 @@ import (
 	"math/rand"
 	"os"
 	"path"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/arkbriar/filechannel/internal/utils"
 )
 
 var testDir = path.Join(os.TempDir(), "file_channel")
@@ -42,6 +46,109 @@ func magicPayload(n int) []byte {
 		r := bytes.Repeat(magicBytes, (n+len(magicBytes)-1)/len(magicBytes))
 		return r[:n]
 	}
+}
+
+type failNow interface {
+	assert.TestingT
+
+	FailNow()
+}
+
+func setup(t failNow, name string, opts ...Option) *FileChannel {
+	targetDir := path.Join(testDir, name)
+
+	// Remove the directory.
+	err := os.RemoveAll(targetDir)
+	if !os.IsNotExist(err) && !assert.NoError(t, err, "failed to remove directory") {
+		t.FailNow()
+	}
+
+	// Create the directory.
+	err = os.MkdirAll(targetDir, os.ModePerm)
+	if !assert.NoError(t, err, "failed to create directory") {
+		t.FailNow()
+	}
+
+	// Open file channel and return.
+	fc, err := OpenFileChannel(targetDir, opts...)
+	if !assert.NoError(t, err, "failed to open file channel") {
+		t.FailNow()
+	}
+
+	return fc
+}
+
+func teardown(t failNow, fc *FileChannel, ignoreClosed bool) {
+	targetDir := fc.dir
+
+	// Close the file channel.
+	err := fc.Close()
+	if !ignoreClosed || errors.Is(err, ErrChannelClosed) {
+		assert.NoError(t, err, "failed to close file channel")
+	}
+
+	// Remove the directory.
+	err = os.RemoveAll(targetDir)
+	if !assert.NoError(t, err, "failed to remove directory") {
+		t.FailNow()
+	}
+}
+
+func writeAll(t failNow, fc *FileChannel, data func(int) []byte, size int) {
+	for i := 0; i < size; i++ {
+		err := fc.Write(data(i))
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+	}
+	err := fc.Flush()
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+}
+
+func writeBytesList(t failNow, fc *FileChannel, bytesList [][]byte) {
+	writeAll(t, fc, func(i int) []byte {
+		return bytesList[i]
+	}, len(bytesList))
+}
+
+func writeStringList(t failNow, fc *FileChannel, strs []string) {
+	writeAll(t, fc, func(i int) []byte {
+		return []byte(strs[i])
+	}, len(strs))
+}
+
+func readAll(t failNow, it *Iterator, data func(int) []byte, size int, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	for i := 0; i < size; i++ {
+		p, err := it.Next(ctx)
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		if !assert.Equal(t, data(i), p) {
+			t.FailNow()
+		}
+	}
+
+	_, err := it.TryNext()
+	if !assert.ErrorIs(t, err, ErrNotEnoughMessages) {
+		t.FailNow()
+	}
+}
+
+func readBytesList(t failNow, it *Iterator, bytesList [][]byte, timeout time.Duration) {
+	readAll(t, it, func(i int) []byte {
+		return bytesList[i]
+	}, len(bytesList), timeout)
+}
+
+func readStringList(t failNow, it *Iterator, strs []string, timeout time.Duration) {
+	readAll(t, it, func(i int) []byte {
+		return []byte(strs[i])
+	}, len(strs), timeout)
 }
 
 func TestParseSegmentIndexAndState(t *testing.T) {
@@ -96,52 +203,6 @@ func TestParseSegmentIndexAndState(t *testing.T) {
 	}
 }
 
-type failNow interface {
-	assert.TestingT
-
-	FailNow()
-}
-
-func setup(t failNow, name string, opts ...Option) *FileChannel {
-	targetDir := path.Join(testDir, name)
-
-	// Remove the directory.
-	err := os.RemoveAll(targetDir)
-	if !os.IsNotExist(err) && !assert.NoError(t, err, "failed to remove directory") {
-		t.FailNow()
-	}
-
-	// Create the directory.
-	err = os.MkdirAll(targetDir, os.ModePerm)
-	if !assert.NoError(t, err, "failed to create directory") {
-		t.FailNow()
-	}
-
-	// Open file channel and return.
-	fc, err := OpenFileChannel(targetDir, opts...)
-	if !assert.NoError(t, err, "failed to open file channel") {
-		t.FailNow()
-	}
-
-	return fc
-}
-
-func teardown(t failNow, fc *FileChannel, ignoreClosed bool) {
-	targetDir := fc.dir
-
-	// Close the file channel.
-	err := fc.Close()
-	if !ignoreClosed || errors.Is(err, ErrChannelClosed) {
-		assert.NoError(t, err, "failed to close file channel")
-	}
-
-	// Remove the directory.
-	err = os.RemoveAll(targetDir)
-	if !assert.NoError(t, err, "failed to remove directory") {
-		t.FailNow()
-	}
-}
-
 func TestFileChannel_Simple(t *testing.T) {
 	fc := setup(t, "test_file_channel_simple")
 	defer teardown(t, fc, true)
@@ -153,100 +214,48 @@ func TestFileChannel_Simple(t *testing.T) {
 		{0x1, 0x2, 0x3, 0x4},
 		{0x1, 0x2, 0x3, 0x4, 0x5},
 	}
-	// Write some data.
-	for _, msg := range messages {
-		err := fc.Write(msg)
-		if !assert.NoError(t, err) {
-			t.FailNow()
-		}
-	}
 
-	// Create an iterator and then close it.
+	writeBytesList(t, fc, messages)
+
 	it := fc.Iterator()
-	if !assert.NoError(t, fc.Close()) {
-		t.FailNow()
-	}
+	readBytesList(t, it, messages, time.Second)
 
-	// Read them all.
-	i := 0
-	for i < len(messages) {
-		msg, err := it.Next(context.Background())
-		if !assert.NoError(t, err) {
-			t.FailNow()
-		}
-		assert.Equal(t, msg, messages[i])
-		i++
-	}
-
-	_, err := it.Next(context.Background())
-	assert.Error(t, err, ErrChannelClosed)
+	assert.NoError(t, it.Close())
 }
 
 func TestFileChannel_ReadCompressed(t *testing.T) {
 	fc := setup(t, "test_file_channel_read_compressed", RotateThreshold(1<<20))
 	defer teardown(t, fc, true)
 
-	// Write 10 MB data.
-	const payloadSize = 128
-	msgNum := (10 << 20) / payloadSize
-	payload := magicPayload(128)
+	const payloadSize, totalSize = 128, 10 << 20
+	msgNum := totalSize / payloadSize
+	payload := magicPayload(payloadSize)
 
-	for i := 0; i < msgNum; i++ {
-		err := fc.Write(payload)
-		if !assert.NoError(t, err) {
-			t.FailNow()
-		}
-	}
+	writeAll(t, fc, func(_ int) []byte { return payload }, msgNum)
 
-	// Read them all. Close channel to make sure the heading segments were
-	// all compressed.
+	// Wait until the first segment is compressed.
+	checkFileChannelDir(t, fc.dir, func(entries []os.DirEntry) bool {
+		return slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+			return entry.Name() == "segment.0.z"
+		})
+	}, 10*time.Second)
+
 	it := fc.Iterator()
-	if !assert.NoError(t, fc.Close()) {
-		t.FailNow()
-	}
-	for i := 0; i < msgNum; i++ {
-		msg, err := it.Next(context.Background())
-		if !assert.NoError(t, err) {
-			t.FailNow()
-		}
-		if !assert.Equal(t, payload, msg) {
-			t.FailNow()
-		}
-	}
+	readAll(t, it, func(_ int) []byte { return payload }, msgNum, 10*time.Second)
+
+	assert.NoError(t, it.Close())
 }
 
-var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-func RandStringRunes(rand *rand.Rand, n int) string {
-	b := make([]rune, n)
-	for i := range b {
-		b[i] = letterRunes[rand.Intn(len(letterRunes))]
-	}
-	return string(b)
-}
-
-func testFileChannelWithRandomStrings(t *testing.T, rand *rand.Rand, minLen, maxLen, size int, parallelism int) {
-	fc := setup(t, fmt.Sprintf("file_channel_benchmark_random_%d_%d_%d", minLen, maxLen, size))
+func testFileChannelWithRandomStrings(t *testing.T, rand *rand.Rand, minLen, maxLen, size int, parallelism int, opts ...Option) {
+	fc := setup(t, fmt.Sprintf("file_channel_benchmark_random_%d_%d_%d", minLen, maxLen, size), opts...)
 	defer teardown(t, fc, false)
 
 	strList := make([]string, size)
-	totalStrLen := 0
 	for i := 0; i < size; i++ {
-		strList[i] = RandStringRunes(rand, rand.Intn(maxLen-minLen)+minLen)
-		totalStrLen += len(strList[i])
+		strList[i] = utils.RandomString(rand, rand.Intn(maxLen-minLen)+minLen)
 	}
-	fmt.Printf("Total string length: %d\n", totalStrLen)
 
-	// Write them all.
-	for _, s := range strList {
-		err := fc.Write([]byte(s))
-		if !assert.NoError(t, err) {
-			t.FailNow()
-		}
-	}
-	if !assert.NoError(t, fc.Flush()) {
-		t.FailNow()
-	}
+	writeStringList(t, fc, strList)
 
 	// Read them all.
 	wg := &sync.WaitGroup{}
@@ -283,84 +292,141 @@ func testFileChannelWithRandomStrings(t *testing.T, rand *rand.Rand, minLen, max
 }
 
 func TestFileChannelWithRandomStrings(t *testing.T) {
-	testFileChannelWithRandomStrings(t, rand.New(rand.NewSource(10)), 0, 512, 1<<20, 1)
+	testFileChannelWithRandomStrings(t, rand.New(rand.NewSource(1)), 0, 512, 1<<15, 1)
 }
 
-func TestFileChannelWithRandomStrings_Parallel(t *testing.T) {
-	testFileChannelWithRandomStrings(t, rand.New(rand.NewSource(10)), 0, 512, 1<<20, 4)
+func TestFileChannelWithRandomStringsAndSmallRotationThreshold(t *testing.T) {
+	testFileChannelWithRandomStrings(t, rand.New(rand.NewSource(1)),
+		0, 512, 1<<20, 1, RotateThreshold(10<<20))
 }
 
-func benchmarkFileChannelWrite(b *testing.B, size int) {
-	fc := setup(b, fmt.Sprintf("file_channel_benchmark_write_%d", size))
-	defer teardown(b, fc, false)
+func TestFileChannelWithRandomStrings_Parallel_2(t *testing.T) {
+	testFileChannelWithRandomStrings(t, rand.New(rand.NewSource(2)), 0, 128, 1<<15, 4)
+}
 
-	// Run benchmark.
-	b.ResetTimer()
-	payload := make([]byte, size)
-	for n := 0; n < b.N; n++ {
-		err := fc.Write(payload)
-		if !assert.NoError(b, err) {
-			b.FailNow()
+func TestFileChannelWithRandomStrings_Parallel_4(t *testing.T) {
+	testFileChannelWithRandomStrings(t, rand.New(rand.NewSource(3)), 0, 64, 1<<15, 4)
+}
+
+func listDir(dir string) ([]os.DirEntry, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return f.ReadDir(-1)
+}
+
+func checkFileChannelDir(t *testing.T, targetDir string, prediction func([]os.DirEntry) bool, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	for {
+		dirEntries, err := listDir(targetDir)
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		if prediction(dirEntries) {
+			break
+		}
+		entryNames := make([]string, 0, len(dirEntries))
+		for _, et := range dirEntries {
+			entryNames = append(entryNames, et.Name())
+		}
+		select {
+		case <-timer.C:
+			t.Fatalf("Check failed. Unexpected files found:\n%s",
+				strings.Join(entryNames, " "))
+		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	b.StopTimer()
 }
 
-func benchmarkFileChannelRead(b *testing.B, size int) {
-	fc := setup(b, fmt.Sprintf("file_channel_benchmark_read_%d", size))
-	defer teardown(b, fc, false)
+func TestFileChannel_GC(t *testing.T) {
+	fc := setup(t, "test_file_channel_gc", RotateThreshold(1<<20))
+	defer teardown(t, fc, true)
 
-	// Setup data.
-	payload := magicPayload(size)
-	for i := 0; i < b.N; i++ {
-		err := fc.Write(payload)
-		if !assert.NoError(b, err) {
-			b.FailNow()
-		}
-	}
-	if !assert.NoError(b, fc.Flush()) {
-		b.FailNow()
-	}
+	const payloadSize, totalSize = 128, 10 << 20
+	msgNum := totalSize / payloadSize
+	payload := magicPayload(payloadSize)
 
-	// Create an iterator.
+	writeAll(t, fc, func(_ int) []byte { return payload }, msgNum)
+
+	// Read them all.
 	it := fc.Iterator()
+	readAll(t, it, func(_ int) []byte { return payload }, msgNum, 10*time.Second)
+	assert.NoError(t, it.Close())
 
-	// Run benchmark.
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		_, err := it.Next(context.Background())
+	// Check the directory for at most 2 seconds. There should be only two files and one
+	// of them is the lock file.
+	checkFileChannelDir(t, fc.dir, func(entries []os.DirEntry) bool {
+		return len(entries) == 2 && slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+			return entry.Name() == "lock"
+		})
+	}, 5*time.Second)
+}
 
-		if !assert.NoError(b, err) {
-			b.FailNow()
-		}
+func TestFileChannel_GCWithoutAck(t *testing.T) {
+	fc := setup(t, "test_file_channel_gc_without_ack", RotateThreshold(1<<20))
+	defer teardown(t, fc, true)
+
+	// Write 10 MB data.
+	const payloadSize = 128
+	msgNum := (10 << 20) / payloadSize
+	payload := magicPayload(payloadSize)
+
+	writeAll(t, fc, func(_ int) []byte { return payload }, msgNum)
+
+	// Read them all.
+	it := fc.IteratorAcknowledgable()
+	readAll(t, it, func(_ int) []byte { return payload }, msgNum, 10*time.Second)
+	assert.NoError(t, it.Close())
+
+	// Check the directory for at most 2 seconds. The first segment file should still exist.
+	checkFileChannelDir(t, fc.dir, func(entries []os.DirEntry) bool {
+		return slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+			return entry.Name() == "segment.0" || entry.Name() == "segment.0.z"
+		})
+	}, 2*time.Second)
+}
+
+func testFileChannelRecoveryWriteAndReadWithoutAck(t *testing.T, fc *FileChannel, payload []byte, size int) {
+	writeAll(t, fc, func(_ int) []byte { return payload }, size)
+
+	it := fc.IteratorAcknowledgable()
+	readAll(t, it, func(_ int) []byte { return payload }, size, 10*time.Second)
+	assert.NoError(t, it.Close())
+}
+
+func testFileChannelRecoveryReadAll(t *testing.T, fc *FileChannel, payload []byte, size int) {
+	it := fc.Iterator()
+	readAll(t, it, func(_ int) []byte { return payload }, size, 10*time.Second)
+	assert.NoError(t, it.Close())
+}
+
+func TestFileChannel_Recovery(t *testing.T) {
+	fc := setup(t, "test_file_channel_recovery", RotateThreshold(1<<20))
+	defer func() {
+		teardown(t, fc, false)
+	}()
+
+	const payloadSize, totalSize = 128, 10 << 20
+	msgNum := totalSize / payloadSize
+	payload := magicPayload(payloadSize)
+
+	// Write and read without ack (to reserve data).
+	testFileChannelRecoveryWriteAndReadWithoutAck(t, fc, payload, msgNum)
+
+	// Close the original channel.
+	if !assert.NoError(t, fc.Close()) {
+		t.FailNow()
 	}
-	b.StopTimer()
 
-	// Close it.
-	err := it.Close()
-	assert.NoError(b, err)
-}
+	var err error
+	fc, err = OpenFileChannel(fc.dir, RotateThreshold(1<<20))
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
 
-func BenchmarkFileChannel_Write_16(b *testing.B) {
-	benchmarkFileChannelWrite(b, 16)
-}
-
-func BenchmarkFileChannel_Write_64(b *testing.B) {
-	benchmarkFileChannelWrite(b, 64)
-}
-
-func BenchmarkFileChannel_Write_512(b *testing.B) {
-	benchmarkFileChannelWrite(b, 512)
-}
-
-func BenchmarkFileChannel_Read_16(b *testing.B) {
-	benchmarkFileChannelRead(b, 16)
-}
-
-func BenchmarkFileChannel_Read_64(b *testing.B) {
-	benchmarkFileChannelRead(b, 64)
-}
-
-func BenchmarkFileChannel_Read_512(b *testing.B) {
-	benchmarkFileChannelRead(b, 512)
+	// Read all.
+	testFileChannelRecoveryReadAll(t, fc, payload, msgNum)
 }

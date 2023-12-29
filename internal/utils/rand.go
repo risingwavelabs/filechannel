@@ -14,26 +14,14 @@
 
 package utils
 
-import (
-	"hash/crc32"
-	"io"
-)
+import "math/rand"
 
-type ChecksumWriter struct {
-	checksum uint32
-	w        io.Writer
-}
+var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
-func (w *ChecksumWriter) Checksum() uint32 {
-	return w.checksum
-}
-
-func (w *ChecksumWriter) Write(p []byte) (n int, err error) {
-	n, err = w.w.Write(p)
-	w.checksum = crc32.Update(w.checksum, crc32.IEEETable, p[:n])
-	return
-}
-
-func NewChecksumWriter(w io.Writer) *ChecksumWriter {
-	return &ChecksumWriter{w: w}
+func RandomString(rand *rand.Rand, n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
 }
