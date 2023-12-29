@@ -57,6 +57,9 @@ type FileChannel interface {
 	// The first message received by each receiver is undetermined and
 	// leaved to implementation.
 	Rx() Receiver
+
+	// Close the channel.
+	Close() error
 }
 
 // AckFileChannel is the interface for a file-based persistent channel
@@ -87,6 +90,10 @@ var _ AckFileChannel = &fileChannel{}
 type fileChannel struct {
 	wLock sync.Mutex
 	inner *filechannel.FileChannel
+}
+
+func (f *fileChannel) Close() error {
+	return f.inner.Close()
 }
 
 func (f *fileChannel) Tx() Sender {
@@ -132,7 +139,13 @@ type fileChannelSender struct {
 	inner *filechannel.FileChannel
 }
 
-func (s *fileChannelSender) Send(_ context.Context, p []byte) error {
+func (s *fileChannelSender) Send(ctx context.Context, p []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
