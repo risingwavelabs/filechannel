@@ -26,7 +26,12 @@ import (
 	"github.com/risingwavelabs/filechannel/internal/utils"
 )
 
-func mkdirTemp(t *testing.T) string {
+type testingT interface {
+	assert.TestingT
+	FailNow()
+}
+
+func mkdirTemp(t testingT) string {
 	tmpDir, err := os.MkdirTemp(os.TempDir(), "filechannel_test")
 	if !assert.NoError(t, err) {
 		t.FailNow()
