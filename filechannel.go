@@ -180,7 +180,10 @@ type fileChannelSender struct {
 }
 
 func (s *fileChannelSender) Close() error {
-	s.inner.closeTx()
+	if s.inner != nil {
+		s.inner.closeTx()
+		s.inner = nil
+	}
 	return nil
 }
 
