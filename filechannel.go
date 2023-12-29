@@ -18,7 +18,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/arkbriar/filechannel/internal/filechannel"
+	"github.com/risingwavelabs/filechannel/internal/filechannel"
 )
 
 // Sender sends bytes to file channel.

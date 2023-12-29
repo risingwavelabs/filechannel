@@ -30,7 +30,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/arkbriar/filechannel/internal/utils"
+	"github.com/risingwavelabs/filechannel/internal/utils"
 )
 
 var testDir = path.Join(os.TempDir(), "file_channel")

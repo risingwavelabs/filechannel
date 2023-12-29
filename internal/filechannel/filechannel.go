@@ -35,9 +35,9 @@ import (
 	"github.com/gofrs/flock"
 	"github.com/klauspost/compress/snappy"
 
-	"github.com/arkbriar/filechannel/internal/condvar"
-	"github.com/arkbriar/filechannel/internal/fs"
-	"github.com/arkbriar/filechannel/internal/utils"
+	"github.com/risingwavelabs/filechannel/internal/condvar"
+	"github.com/risingwavelabs/filechannel/internal/fs"
+	"github.com/risingwavelabs/filechannel/internal/utils"
 )
 
 var (

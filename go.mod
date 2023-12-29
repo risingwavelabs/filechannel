@@ -1,4 +1,4 @@
-module github.com/arkbriar/filechannel
+module github.com/risingwavelabs/filechannel
 
 go 1.21.4
 
