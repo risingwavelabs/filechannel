@@ -16,10 +16,14 @@ package filechannel
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/risingwavelabs/filechannel/internal/utils"
 )
 
 func mkdirTemp(t *testing.T) string {
@@ -57,4 +61,81 @@ func TestFileChannel(t *testing.T) {
 	if !assert.Equal(t, msg, p) {
 		t.FailNow()
 	}
+}
+
+func printMemoryStats(title string) {
+	memStats := &runtime.MemStats{}
+	runtime.ReadMemStats(memStats)
+
+	fmt.Println(title)
+	fmt.Printf(`Alloc: %s
+TotalAlloc: %s
+Sys: %s
+Lookups: %d
+Mallocs: %d
+Frees: %d
+HeapAlloc: %s
+HeapSys: %s
+HeapIdle: %s
+HeapInuse: %s
+HeapReleased: %s
+HeapObjects: %d
+`,
+		utils.ByteCountIEC(memStats.Alloc),
+		utils.ByteCountIEC(memStats.TotalAlloc),
+		utils.ByteCountIEC(memStats.Sys),
+		memStats.Lookups,
+		memStats.Mallocs,
+		memStats.Frees,
+		utils.ByteCountIEC(memStats.HeapAlloc),
+		utils.ByteCountIEC(memStats.HeapSys),
+		utils.ByteCountIEC(memStats.HeapIdle),
+		utils.ByteCountIEC(memStats.HeapInuse),
+		utils.ByteCountIEC(memStats.HeapReleased),
+		memStats.HeapObjects,
+	)
+	fmt.Println()
+}
+
+func TestFileChannel_MemoryConsumption(t *testing.T) {
+	tmpDir := mkdirTemp(t)
+	defer printMemoryStats("=========== AFTER ALL ===========")
+	defer os.RemoveAll(tmpDir)
+
+	printMemoryStats("=========== BEFORE ALL ===========")
+
+	fch, err := OpenFileChannel(tmpDir)
+	if !assert.NoError(t, err) {
+		t.FailNow()
+	}
+	defer fch.Close()
+
+	printMemoryStats("=========== AFTER OPEN ===========")
+
+	msg := []byte("Hello world!")
+
+	const iterateCount = 2 << 20
+	tx := fch.Tx()
+	for i := 0; i < iterateCount; i++ {
+		err = tx.Send(context.Background(), msg)
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+	}
+
+	printMemoryStats("=========== AFTER SENDING ===========")
+
+	rx := fch.Rx()
+	defer rx.Close()
+	for i := 0; i < iterateCount; i++ {
+		p, err := rx.Recv(context.Background())
+		if !assert.NoError(t, err) {
+			t.FailNow()
+		}
+		if !assert.Equal(t, msg, p) {
+			t.FailNow()
+		}
+	}
+
+	printMemoryStats("=========== AFTER RECEIVING ===========")
 }

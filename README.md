@@ -74,3 +74,79 @@ BenchmarkFileChannel_ParallelRead_64-4    	26518456	       42.85 ns/op	      56 
 BenchmarkFileChannel_ParallelRead_512
 BenchmarkFileChannel_ParallelRead_512-4   	27467155	       42.09 ns/op	      56 B/op	       2 allocs/op
 ```
+
+## Memory Consumption
+
+From test case `TestFileChannel_MemoryConsumption`.
+
+```text
+=========== BEFORE ALL ===========
+Alloc: 240.3 KiB
+TotalAlloc: 240.3 KiB
+Sys: 7.4 MiB
+Lookups: 0
+Mallocs: 1024
+Frees: 122
+HeapAlloc: 240.3 KiB
+HeapSys: 3.7 MiB
+HeapIdle: 3.0 MiB
+HeapInuse: 632.0 KiB
+HeapReleased: 3.0 MiB
+HeapObjects: 902
+
+=========== AFTER OPEN ===========
+Alloc: 249.5 KiB
+TotalAlloc: 249.5 KiB
+Sys: 7.4 MiB
+Lookups: 0
+Mallocs: 1101
+Frees: 130
+HeapAlloc: 249.5 KiB
+HeapSys: 3.7 MiB
+HeapIdle: 3.0 MiB
+HeapInuse: 656.0 KiB
+HeapReleased: 3.0 MiB
+HeapObjects: 971
+
+=========== AFTER SENDING ===========
+Alloc: 2.5 MiB
+TotalAlloc: 16.6 MiB
+Sys: 14.3 MiB
+Lookups: 0
+Mallocs: 2104024
+Frees: 1953265
+HeapAlloc: 2.5 MiB
+HeapSys: 7.6 MiB
+HeapIdle: 4.5 MiB
+HeapInuse: 3.0 MiB
+HeapReleased: 2.9 MiB
+HeapObjects: 150759
+
+=========== AFTER RECEIVING ===========
+Alloc: 2.5 MiB
+TotalAlloc: 226.0 MiB
+Sys: 14.3 MiB
+Lookups: 0
+Mallocs: 10514798
+Frees: 10421026
+HeapAlloc: 2.5 MiB
+HeapSys: 7.6 MiB
+HeapIdle: 4.5 MiB
+HeapInuse: 3.0 MiB
+HeapReleased: 2.9 MiB
+HeapObjects: 93772
+
+=========== AFTER ALL ===========
+Alloc: 2.5 MiB
+TotalAlloc: 226.0 MiB
+Sys: 14.3 MiB
+Lookups: 0
+Mallocs: 10514861
+Frees: 10421037
+HeapAlloc: 2.5 MiB
+HeapSys: 7.5 MiB
+HeapIdle: 4.5 MiB
+HeapInuse: 3.1 MiB
+HeapReleased: 2.9 MiB
+HeapObjects: 93824
+```
