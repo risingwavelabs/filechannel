@@ -66,7 +66,7 @@ BenchmarkFileChannel_ReadWrite_16-4       	 6157968	       197.0 ns/op	      64 
 BenchmarkFileChannel_ReadWrite_64
 BenchmarkFileChannel_ReadWrite_64-4       	 4252632	       281.8 ns/op	      64 B/op	       3 allocs/op
 BenchmarkFileChannel_ReadWrite_512
-BenchmarkFileChannel_ReadWrite_512-4      	  902235	      1116 ns/op	      65 B/op	       3 allocs/op
+BenchmarkFileChannel_ReadWrite_512-4      	  902235	       1116 ns/op	      65 B/op	       3 allocs/op
 BenchmarkFileChannel_ParallelRead_16
 BenchmarkFileChannel_ParallelRead_16-4    	29948120	        38.91 ns/op	      56 B/op	       2 allocs/op
 BenchmarkFileChannel_ParallelRead_64
