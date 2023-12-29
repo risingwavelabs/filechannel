@@ -149,6 +149,7 @@ type Iterator struct {
 	segmentIndex uint32
 	f            *fs.SequentialFile
 	r            io.Reader
+	headerBuf    [MessageHeaderBinarySize]byte
 
 	autoAck         bool
 	readerIndex     uint32
@@ -240,8 +241,7 @@ func (it *Iterator) ensure() error {
 	return nil
 }
 
-func ReadNext(r io.Reader, w io.Writer) error {
-	var hBuf [MessageHeaderBinarySize]byte
+func ReadNext(r io.Reader, w io.Writer, hBuf []byte) error {
 	n, err := io.ReadFull(r, hBuf[:])
 	if err != nil {
 		if err == io.EOF {
@@ -283,7 +283,7 @@ func ReadNext(r io.Reader, w io.Writer) error {
 }
 
 func (it *Iterator) readNext() ([]byte, error) {
-	err := ReadNext(it.r, it.buf)
+	err := ReadNext(it.r, it.buf, it.headerBuf[:])
 	if err != nil {
 		return nil, err
 	}
@@ -834,9 +834,10 @@ func repairPlainSegment(file string) (PlainSegmentHeader, uint64, error) {
 
 	lastReadCount := uint64(0)
 	discard := utils.NewCountWriter(io.Discard)
+	var mHeaderBuf [MessageHeaderBinarySize]byte
 	msgCnt := 0
 	for {
-		err = ReadNext(f, discard)
+		err = ReadNext(f, discard, mHeaderBuf[:])
 		if err != nil {
 			break
 		}
