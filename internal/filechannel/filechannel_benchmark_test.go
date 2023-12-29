@@ -28,9 +28,54 @@ func benchmarkFileChannelWrite(b *testing.B, size int) {
 
 	// Run benchmark.
 	b.ResetTimer()
-	payload := make([]byte, size)
+	payload := magicPayload(size)
+	writeAll(b, fc, func(_ int) []byte { return payload }, b.N)
+	b.StopTimer()
+}
+
+func benchmarkFileChannelRead(b *testing.B, size int) {
+	fc := setup(b, fmt.Sprintf("file_channel_benchmark_read_%d", size))
+	defer teardown(b, fc, false)
+
+	// Setup data.
+	payload := magicPayload(size)
+	writeAll(b, fc, func(_ int) []byte { return payload }, b.N)
+
+	// Create an iterator.
+	it := fc.Iterator()
+
+	// Run benchmark.
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		_, err := it.Next(context.Background())
+		if !assert.NoError(b, err) {
+			b.FailNow()
+		}
+	}
+	b.StopTimer()
+
+	// Close it.
+	err := it.Close()
+	assert.NoError(b, err)
+}
+
+func benchmarkFileChannelReadWrite(b *testing.B, size int) {
+	fc := setup(b, fmt.Sprintf("file_channel_benchmark_read_write_%d", size))
+	defer teardown(b, fc, false)
+
+	// Run benchmark.
+	payload := magicPayload(size)
+	it := fc.Iterator()
+
+	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		err := fc.Write(payload)
+		if !assert.NoError(b, err) {
+			b.FailNow()
+		}
+	}
+	for n := 0; n < b.N; n++ {
+		_, err := it.Next(context.Background())
 		if !assert.NoError(b, err) {
 			b.FailNow()
 		}
@@ -38,7 +83,7 @@ func benchmarkFileChannelWrite(b *testing.B, size int) {
 	b.StopTimer()
 }
 
-func benchmarkFileChannelRead(b *testing.B, size int) {
+func benchmarkFileChannelParallelRead(b *testing.B, size int) {
 	fc := setup(b, fmt.Sprintf("file_channel_benchmark_read_%d", size))
 	defer teardown(b, fc, false)
 
@@ -54,23 +99,18 @@ func benchmarkFileChannelRead(b *testing.B, size int) {
 		b.FailNow()
 	}
 
-	// Create an iterator.
-	it := fc.Iterator()
-
 	// Run benchmark.
 	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
-		_, err := it.Next(context.Background())
-
-		if !assert.NoError(b, err) {
-			b.FailNow()
+	b.RunParallel(func(pb *testing.PB) {
+		it := fc.Iterator()
+		for pb.Next() {
+			_, err := it.Next(context.Background())
+			if !assert.NoError(b, err) {
+				b.FailNow()
+			}
 		}
-	}
-	b.StopTimer()
-
-	// Close it.
-	err := it.Close()
-	assert.NoError(b, err)
+		assert.NoError(b, it.Close())
+	})
 }
 
 func BenchmarkFileChannel_Write_16(b *testing.B) {
@@ -95,4 +135,28 @@ func BenchmarkFileChannel_Read_64(b *testing.B) {
 
 func BenchmarkFileChannel_Read_512(b *testing.B) {
 	benchmarkFileChannelRead(b, 512)
+}
+
+func BenchmarkFileChannel_ReadWrite_16(b *testing.B) {
+	benchmarkFileChannelReadWrite(b, 16)
+}
+
+func BenchmarkFileChannel_ReadWrite_64(b *testing.B) {
+	benchmarkFileChannelReadWrite(b, 64)
+}
+
+func BenchmarkFileChannel_ReadWrite_512(b *testing.B) {
+	benchmarkFileChannelReadWrite(b, 512)
+}
+
+func BenchmarkFileChannel_ParallelRead_16(b *testing.B) {
+	benchmarkFileChannelParallelRead(b, 16)
+}
+
+func BenchmarkFileChannel_ParallelRead_64(b *testing.B) {
+	benchmarkFileChannelParallelRead(b, 64)
+}
+
+func BenchmarkFileChannel_ParallelRead_512(b *testing.B) {
+	benchmarkFileChannelParallelRead(b, 64)
 }

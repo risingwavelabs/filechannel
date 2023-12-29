@@ -225,9 +225,12 @@ func (it *Iterator) openFile() error {
 }
 
 func (it *Iterator) closeFile() error {
-	err := it.f.Close()
-	it.f, it.r = nil, nil
-	return err
+	if it.f != nil {
+		err := it.f.Close()
+		it.f, it.r = nil, nil
+		return err
+	}
+	return nil
 }
 
 func (it *Iterator) ensure() error {
