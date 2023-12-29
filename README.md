@@ -77,7 +77,7 @@ BenchmarkFileChannel_ParallelRead_512-4   	27467155	       42.09 ns/op	      56 
 
 ## Memory Consumption
 
-From test case `TestFileChannel_MemoryConsumption`.
+From test case [`TestFileChannel_MemoryConsumption`](https://github.com/risingwavelabs/filechannel/blob/02461081d05b48825484e0c9593dd982328bc92d/filechannel_test.go#L100).
 
 ```text
 =========== BEFORE ALL ===========
