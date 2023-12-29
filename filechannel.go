@@ -25,6 +25,9 @@ import (
 type Sender interface {
 	// Send bytes to file channel. Data will be finally persistent on disk.
 	Send(context.Context, []byte) error
+
+	// Close closes a sender.
+	Close() error
 }
 
 // Receiver receives bytes from file channel in the sending order.
@@ -58,7 +61,7 @@ type FileChannel interface {
 	// leaved to implementation.
 	Rx() Receiver
 
-	// Close the channel.
+	// Close the channel. Unclosed senders will block the method.
 	Close() error
 }
 
@@ -88,19 +91,55 @@ var (
 var _ AckFileChannel = &fileChannel{}
 
 type fileChannel struct {
-	wLock sync.Mutex
-	inner *filechannel.FileChannel
+	wRefLock sync.Mutex
+	wRefCond *sync.Cond
+	wRefCnt  int
+	wLock    sync.Mutex
+	inner    *filechannel.FileChannel
 }
 
 func (f *fileChannel) Close() error {
-	return f.inner.Close()
+	f.wRefLock.Lock()
+	defer f.wRefLock.Unlock()
+	for f.wRefCnt != 0 {
+		f.wRefCond.Wait()
+	}
+
+	err := f.inner.Close()
+	f.inner = nil
+	return err
+}
+
+func (f *fileChannel) send(bytes []byte) error {
+	f.wLock.Lock()
+	defer f.wLock.Unlock()
+
+	return f.inner.Write(bytes)
+}
+
+func (f *fileChannel) flush() error {
+	f.wLock.Lock()
+	defer f.wLock.Unlock()
+
+	return f.inner.Flush()
 }
 
 func (f *fileChannel) Tx() Sender {
+	f.wRefLock.Lock()
+	defer f.wRefLock.Unlock()
+	f.wRefCnt++
+
 	return &fileChannelSender{
-		lock:  &f.wLock,
-		inner: f.inner,
+		inner: f,
 	}
+}
+
+func (f *fileChannel) closeTx() {
+	f.wRefLock.Lock()
+	defer f.wRefLock.Unlock()
+
+	f.wRefCnt--
+	f.wRefCond.Signal()
 }
 
 func (f *fileChannel) Rx() Receiver {
@@ -118,7 +157,9 @@ func openFileChannel(dir string, opts ...Option) (*fileChannel, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fileChannel{inner: inner}, nil
+	f := &fileChannel{inner: inner}
+	f.wRefCond = sync.NewCond(&f.wRefLock)
+	return f, nil
 }
 
 // OpenFileChannel opens a new FileChannel.
@@ -135,8 +176,12 @@ func OpenAckFileChannel(dir string, opts ...Option) (AckFileChannel, error) {
 var _ Sender = &fileChannelSender{}
 
 type fileChannelSender struct {
-	lock  sync.Locker
-	inner *filechannel.FileChannel
+	inner *fileChannel
+}
+
+func (s *fileChannelSender) Close() error {
+	s.inner.closeTx()
+	return nil
 }
 
 func (s *fileChannelSender) Send(ctx context.Context, p []byte) error {
@@ -146,10 +191,7 @@ func (s *fileChannelSender) Send(ctx context.Context, p []byte) error {
 	default:
 	}
 
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	return s.inner.Write(p)
+	return s.inner.send(p)
 }
 
 // Compiler fence.

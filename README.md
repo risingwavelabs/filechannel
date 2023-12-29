@@ -21,6 +21,7 @@ func Example(dir string) error {
 	msg := []byte("Hello world!")
 
 	tx := fch.Tx()
+	defer tx.Close()
 	err = tx.Send(context.Background(), msg)
 	if err != nil {
 		return err

@@ -47,6 +47,7 @@ func TestFileChannel(t *testing.T) {
 	msg := []byte("Hello world!")
 
 	tx := fch.Tx()
+	defer tx.Close()
 	err = tx.Send(context.Background(), msg)
 	if !assert.NoError(t, err) {
 		t.FailNow()
@@ -116,6 +117,7 @@ func TestFileChannel_MemoryConsumption(t *testing.T) {
 
 	const iterateCount = 2 << 20
 	tx := fch.Tx()
+	defer tx.Close()
 	for i := 0; i < iterateCount; i++ {
 		err = tx.Send(context.Background(), msg)
 		if !assert.NoError(t, err) {
