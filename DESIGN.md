@@ -1,30 +1,41 @@
-# Design
+# Design of File Channel
+
+In general, file channel is a file based persistent channel.
 
 ## Interface
 
-File channel is a file based persistent channel for serializable messages. The interface looks like:
-
 ```go
-type Sender[T any] interface {
-	Send(context.Context, *T) error
+package filechannel
+
+import "context"
+
+type Sender interface {
+	Send(context.Context, []byte) error
+	Close() error
 }
 
-type Receiver[T any] interface {
-	Recv(context.Context, *T) error
+type Receiver interface {
+	Recv(context.Context) ([]byte, error)
+	Close() error
 }
 
-type FileChannel[T any] interface {
-	Tx() Sender[T]
-	Rx() Receiver[T]
+type FileChannel interface {
+	Tx() Sender
+	Rx() Receiver
+	Close() error
 }
 ```
 
-Before optimization, let's consider it as a SPSC (single producer single consumer) queue.
-
+Developer can create `Sender` and `Receiver` from a `FileChannel` to send and receive messages in bytes through the 
+channel. The `Send` and `Recv` methods both accept a `Context` to help on the cancellation. Once `Context` is done,
+the methods will return immediately with the error from the `Context`. The operations shall be transactional: either 
+succeed and update the channel, or fail and leave the channel untouched.
 
 ## On-disk Data Structure
 
-Message:
+### Message and Channel
+
+Structure of a message:
 
 ```plain
 |---- Length ----|---- CRC32 ----|---- Payload ----|
@@ -32,121 +43,55 @@ Message:
 |----   4    ----|----   4   ----|---- length  ----|
 ```
 
-Overview:
+Structure of a channel:
 
 ```plain
 | message 1 | message 2 |   ...   | message N |
 ```
 
-## Sychronization between Read and Write
+## Operations
 
-Offset is the global offset in the on-disk data. The type is `uint64`. 
+The following design doesn't take concurrency into consideration.
 
-```plain
-read offset |                                               | write offset
-            |                                               |
-   GC-able  | message R | message R +1 |   ...   | message W|
-```
+### Send (Write)
 
-Valid offset must be either
-- zero,
-- at the beginning of a message,
-- at the end of a message.
+Sending a message to channel simply appends it and its header to the disk. Since the writing process must be 
+transactional, `Context` won't be effective anymore once it starts to append. Furthermore, sending fails on any failure 
+returned by the IO operations and will prevent any further sending from happening. Thus, IO error such as disk full 
+basically locks a channel and make it read-only. 
 
-Read operations must
-- proceed immediately when `read offset < write offset`,
-- wait when `read offset >= write offset`.
+### Recv (Read)
 
-## Persistency during Restarts
+Similar to sending, receiving from a channel reads message frame from disk. It validates the checksum before returning 
+the raw message to the invoker. IO errors and validation errors indicates the channel might be broken. When implementing
+a `Receiver`, no further `Recv` can succeed after a preceding error.
 
-Properties must hold:
-- Write to the tail.
-- Read from the head.
+`Recv` must wait until there is message left to read. That means there should be some sort of synchronization between 
+sending and receiving so that a waiting reader can be notified when a message is written. Such synchronization can be 
+easily implemented with a conditional variable in other languages. However, the Go's `sync.Cond` doesn't provide a way 
+to interact with `Context`. Luckily there's a [workaround](internal/condvar/condvar.go).
 
-Read offset and write offset should be recorded somewhere on the disk. Let's say a separate file named `offset`.
+## Concurrency
 
-Before read / write operations return:
-- In memory (user space) data must be flushed to OS.
-- Offsets must be written into the `offset` file.
+Limited by the data structure, there's no way except locking to achieve concurrency on a single `Sender` and `Receiver`.
 
-Restart process:
-1. Load read and write offsets.
-2. Open the file and seek the offsets.
-3. Run checks.
-4. Construct other memory structures.
+## Persistency & Crash consistency
 
-## Crash consistency
+Data must be written to the OS before a `Send` operation finishes. However, there's no guarantee that the OS will 
+persist to the underlying disk immediately. That basically means
 
-Crash consistency requires transactional operations like databases. A `fsync` must be invoded before the `Send` or `Recv` operation return. It will greatly downgrade the overall performance since the maximum IOPS of the underlying disk will be the bottleneck.
+- During process restarts, there won't be any data loss.
+- During machine crashes, there might be data loss at the end of the channel.
 
-Crash consistency should be able to be disabled to suit the cases where we favor performance.
-
-## Fan-out Receivers
-
-```go
-type FanOutReceiver[T any] interface {
-    Receiver[T]
-    
-    ID() uint64
-    Close() error
-}
-
-type FanOutFileChannel[T any] interface {
-    Tx() Sender[T]
-    Rx() FanOutReceiver[T]
-}
-```
-
-Each fan-out receiver holds a read offset. GC-able regions are defined as the regions with offset less equal than the minimum of all the fan-out receivers' read offsets.
-
-In terms of locks, It requires an overall synchronization to achieve the effect above. Besides, it's easy to extend a SPSC channel to one supports fan-out receivers as long as it provides control over the `read offset`.
-
-
-```go
-type spscChannel interface {
-    SetReadOffset(uint64)
-}
-
-type fanoutChannel struct {
-    mu          sync.Mutex
-    readOffsets []uint64
-    inner       spscChannel
-}
-
-// SetReadOffset is a callback function when a fan-out receiver advances.
-func (c *fanoutChannel) SetReadOffset(i int, offset uint64) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    
-    // assert offset >= c.readOffsets[i]
-    c.readOffsets[i] = offset
-    
-    minReadOffset := slices.Min(c.readOffsets)
-    
-    c.inner.SetReadOffset(minReadOffset)
-}
-```
-
+File channel should be able to handle both cases. It's easy to read through the channel and find the right margin where 
+the next message is broken, or there's no message anymore. A file channel should trim the broken messages. 
 
 ## Optimization
 
-### Acknowledgable
+### File Segments
 
-Acknowledgable means that one can peek the head (or even the elements after the head as long as they exist) without modifying the `read offset`. Meanwhile, the file channel will provide an `Ack` method in order to advance the `read offset` manually.
-
-```go
-type Acknowledgable interface {
-    UnackCount() uint
-    
-    Ack(uint) error
-}
-```
-
-It's also feasible when file channel supports control over the `read offset`. The receiver should maintain a local buffer to record the unacked offsets and set the underlying `read offset` when `Ack` is invoked.
-
-### File as Segment
-
-While a large single file works, it's non-trivial to perform GC and partial compression on it. Segmenting the whole channel into files is a viable solution. 
+While a large single file works, it's non-trivial to perform GC and partial compression on it. Segmenting the whole 
+channel into files is a viable solution.
 
 ```plain
 segment.0    # read-only, offset [0, 1000)
@@ -155,7 +100,9 @@ segment.2    # read-only, offset [2001, 3003)
 segment.3    # read-write, offset [3003,)
 ```
 
-The last file is the one where new data appended. Preceding files are all read-only. Sequence of files in order formed the whole space of the channel. Therefore, GC could be segment (file) based. Once a segment is entirely within the GC interval, then the GC worker could remove it.
+The last file is the one where new data appended. Preceding files are all read-only. Sequence of files in order formed 
+the whole space of the channel. Therefore, GC could be segment based. Once a segment is entirely within the GC interval,
+then the GC worker could remove it.
 
 Each file should have a header recording the following information:
 
@@ -164,24 +111,21 @@ Each file should have a header recording the following information:
 |---- segment id ----|---- begin offset ----|
 ```
 
-The endding offset isn't record in order to keep the file append-only. Once a segment is decided to be cut, the writing file is sealed and closed. A new file with greater segment id is created.
-
-Synchronization on the writing file is simply done in the following way:
-- An fd is opened for write only to append the data.
-- Extra fd will be opened on the writing file for read only. Then closing the fd for write won't affect reads.
-- Synchronization of offsets will be down with lock and conditional variable. Simple and neat.
-
+The ending offset isn't record in order to keep the file append-only. Once a segment is decided to be cut, the writing 
+file is sealed and closed. A new file with greater segment id will be created.
 
 #### Compression on Segments
 
-This is a follow-up optimization on the segment files. Once a file is sealed to be read-only, we could compress it to save disk space. The process could be as following:
+This is a follow-up optimization on the segment files. Once a file is sealed to be read-only, we could compress it to 
+save disk space. The process could be as following:
+
 1. For each read-only segment file,
 2. Check if it's still valid. If true, then
 3. Compress it with a temporary name.
 4. When finishes, check again if it's still valid.
 5. If true, hold the read lock and rename the file atomically.
-   1. After that, release the lock and delete the original file.
-   2. Deletion shouldn't affect the fds that opened on that file if we open it with carefully chosen flags. (Linux/macOS/Windows)
+    1. After that, release the lock and delete the original file.
+    2. Deletion shouldn't affect the fds that opened on that file if we open it with carefully chosen flags. (Linux/macOS/Windows)
 6. Otherwise, delete the temporary file.
 
 The compressed file has the same name as the uncompressed ones, except an additional suffix `.z`.
@@ -195,30 +139,78 @@ Compressed file could have a different file header to contain more information:
 
 A reader that opens a segment should try the compressed file first and then the original one.
 
+### Buffering
 
-### MPMC
+IO operation per write is known as inefficient due to system calls, especially when the data being written is small.
+A common solution to this problem is buffering in the user space. However, buffering breaks the premise that once a 
+message is sent, it could be read from the file. To address the problem, we should either synchronize read and write 
+on the buffer carefully, or delay the read until the buffer is flushed. We chose the latter. There will be a background
+thread flushes the data periodically and notifies the reader. 
 
-Builtin `chan` and mutex could be a great helper to achieve MPMC.
+Buffering for reading is the same and simpler. It can be done by leveraging the builtin buffered reader.
 
-For concurrent sending, we could just use a structure like the following:
+### Fan-out Receiver
+
+Fan-out receiver is quite straight-forward. However, the first message to receive is undetermined and depends on 
+implementation. Fan-out receivers won't affect each other in any circumstances.
+
+### File Descriptor per Reader/Writer
+
+Like the problem in buffering, a single file descriptor for both read and write will require careful management on it.
+For example, offset to read and write must be maintained separately, and closing must wait until all readers and writers
+exit. Also, buffering is hard because it requires a complex way to do cache eviction. With one file descriptor per 
+reader and writer, it will be much simpler as we delegate almost all things to the OS, and it already handles them well.
+
+### Acknowledgable Receiver
+
+Sometimes, it requires the channel to prevent the messages from being deleted to perform some sort of retrying during
+restarts. For example, a server would like to send all local messages to remote, and it should guarantee all messages 
+are delivered in order. If a delivery fails, it can retry on it. But since the message is read from the channel, it 
+could be deleted from the disk in theory. However, if the process crashes before succeeding in delivery, the message 
+could be lost.
+
+In such cases, we would like to manually acknowledge that the message is successfully consumed so that it's deletable.
+
+The interface looks like
 
 ```go
-type message[T any] struct {
-    ack chan error
-    data *T
+package filechannel
+
+import "context"
+
+type Receiver interface {
+	Recv(context.Context) ([]byte, error)
+	Close() error
 }
 
-type Sender[T any] struct {
-    ack chan error
+type AckReceiver interface {
+	Receiver
 
-    // shared channel from file channel
-    ch chan message[T]
-}
-
-func (s *Sender[T]) Send(ctx context.Context, obj *T) error {
-    s.ch <- message{ack: s.ack, data: obj}
-    return <-s.ack
+	Ack(n int) error
 }
 ```
 
-For concurrent reading, just use a Mutex to guard the receiver.
+`Ack` simply notifies the underlying the file channel that the message is fully consumed. However, when to actually 
+delete it is left to implementation. 
+
+## Trade-offs
+
+The file channel current only guarantees:
+
+1. Messages are received in the same order of sending.
+2. Messages can be received after a bound period after the sending, but there's no promise of how long.
+3. Messages will be finally persistent.
+4. Messages unread by any receiver won't be GC-ed. 
+
+It doesn't guarantee that
+
+1. A message will be persistent immediately once the sending returns.
+2. A message will be persistent during system crashes (e.g., power loss).
+3. A message read in the previous process can be still found in the channel.
+4. A message read in the previous process will be skipped.
+5. A message read by a fan-out receiver can be read by another fan-out receiver because of GC.
+6. A message is GCed once it's read by all receivers.
+
+## Unresolved Problems
+
+1. Support receiving from a specific point to avoid redundant messages upon restart.
