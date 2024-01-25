@@ -200,7 +200,8 @@ The file channel current only guarantees:
 1. Messages are received in the same order of sending.
 2. Messages can be received in a bound period after the sending, but there's no promise of how long.
 3. Messages will be finally persistent.
-4. Messages unread by any receiver won't be GC-ed. 
+4. Messages unread by any receiver (if any) won't be GC-ed.
+5. Messages unread by some receiver won't be GC-ed.
 
 It doesn't guarantee that
 
