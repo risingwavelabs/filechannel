@@ -117,6 +117,7 @@ func (f *fileChannel) send(bytes []byte) error {
 	return f.inner.Write(bytes)
 }
 
+// nolint: unused
 func (f *fileChannel) flush() error {
 	f.wLock.Lock()
 	defer f.wLock.Unlock()

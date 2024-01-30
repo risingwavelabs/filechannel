@@ -145,6 +145,7 @@ func readBytesList(t failNow, it *Iterator, bytesList [][]byte, timeout time.Dur
 	}, len(bytesList), timeout)
 }
 
+// nolint:unused
 func readStringList(t failNow, it *Iterator, strs []string, timeout time.Duration) {
 	readAll(t, it, func(i int) []byte {
 		return []byte(strs[i])

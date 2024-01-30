@@ -349,6 +349,7 @@ func (it *Iterator) waitForData(ctx context.Context) error {
 }
 
 func (it *Iterator) TryNext() ([]byte, error) {
+	// nolint: staticcheck
 	return it.tryNext(nil)
 }
 
@@ -652,7 +653,7 @@ func (sm *SegmentManager) SegmentFile(index uint32, state SegmentFileState) stri
 	return path.Join(sm.dir, sm.segmentFile(index, state))
 }
 
-var segmentFilePattern = regexp.MustCompile("^segment\\.([0-9]+)(\\.\\S+)?$")
+var segmentFilePattern = regexp.MustCompile(`^segment\.([0-9]+)(\.\S+)?$`)
 
 func ParseSegmentIndexAndState(file string) (uint32, SegmentFileState, error) {
 	matches := segmentFilePattern.FindStringSubmatch(path.Base(file))
@@ -1103,7 +1104,7 @@ func (fc *FileChannel) Close() error {
 	err := fc.f.Close()
 	fc.f = nil
 
-	_ = fc.fileLock.Unlock()
+	_ = fc.unlock()
 	fc.fileLock = nil
 
 	return err
