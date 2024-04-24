@@ -23,6 +23,8 @@ import (
 
 // Sender sends bytes to file channel.
 type Sender interface {
+	SenderStats
+
 	// Send bytes to file channel. Data will be finally persistent on disk.
 	Send(context.Context, []byte) error
 
@@ -32,6 +34,8 @@ type Sender interface {
 
 // Receiver receives bytes from file channel in the sending order.
 type Receiver interface {
+	ReceiverStats
+
 	// Recv bytes from file channel.
 	Recv(context.Context) ([]byte, error)
 
@@ -51,6 +55,8 @@ type AckReceiver interface {
 
 // FileChannel is the interface for a file-based persistent channel.
 type FileChannel interface {
+	Stats
+
 	// Tx creates a Sender. Sender is thread safe.
 	// It's possible to have multiple senders at the same time.
 	Tx() Sender
@@ -89,6 +95,7 @@ var (
 
 // Compiler fence.
 var _ AckFileChannel = &fileChannel{}
+var _ Stats = &fileChannel{}
 
 type fileChannel struct {
 	wRefLock sync.Mutex
@@ -96,6 +103,14 @@ type fileChannel struct {
 	wRefCnt  int
 	wLock    sync.Mutex
 	inner    *filechannel.FileChannel
+}
+
+func (f *fileChannel) FlushOffset() uint64 {
+	return f.inner.FlushOffset()
+}
+
+func (f *fileChannel) DiskUsage() (uint64, error) {
+	return f.inner.DiskUsage()
 }
 
 func (f *fileChannel) Close() error {
@@ -108,6 +123,10 @@ func (f *fileChannel) Close() error {
 	err := f.inner.Close()
 	f.inner = nil
 	return err
+}
+
+func (f *fileChannel) writeOffset() uint64 {
+	return f.inner.WriteOffset()
 }
 
 func (f *fileChannel) send(bytes []byte) error {
@@ -175,9 +194,14 @@ func OpenAckFileChannel(dir string, opts ...Option) (AckFileChannel, error) {
 
 // Compiler fence.
 var _ Sender = &fileChannelSender{}
+var _ SenderStats = &fileChannelSender{}
 
 type fileChannelSender struct {
 	inner *fileChannel
+}
+
+func (s *fileChannelSender) WriteOffset() uint64 {
+	return s.inner.writeOffset()
 }
 
 func (s *fileChannelSender) Close() error {
@@ -200,9 +224,14 @@ func (s *fileChannelSender) Send(ctx context.Context, p []byte) error {
 
 // Compiler fence.
 var _ Receiver = &fileChannelReceiver{}
+var _ ReceiverStats = &fileChannelReceiver{}
 
 type fileChannelReceiver struct {
 	inner *filechannel.Iterator
+}
+
+func (r *fileChannelReceiver) ReadOffset() uint64 {
+	return r.inner.Offset()
 }
 
 func (r *fileChannelReceiver) Close() error {
@@ -215,6 +244,7 @@ func (r *fileChannelReceiver) Recv(ctx context.Context) ([]byte, error) {
 
 // Compiler fence.
 var _ AckReceiver = &fileChannelAckReceiver{}
+var _ ReceiverStats = &fileChannelAckReceiver{}
 
 type fileChannelAckReceiver struct {
 	fileChannelReceiver
