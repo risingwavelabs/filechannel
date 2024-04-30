@@ -1,4 +1,4 @@
-// Copyright 2023 RisingWave Labs
+// Copyright 2023-2024 RisingWave Labs
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -158,6 +159,10 @@ type Iterator struct {
 
 	lastErr error
 	buf     *bytes.Buffer
+}
+
+func (it *Iterator) Offset() uint64 {
+	return it.offset
 }
 
 func (it *Iterator) updateOffset(offset uint64) error {
@@ -1305,4 +1310,27 @@ func (fc *FileChannel) IteratorAcknowledgable() *Iterator {
 		panic("file channel closed")
 	}
 	return NewIterator(fc.segmentManager, fc.position, false)
+}
+
+func (fc *FileChannel) WriteOffset() uint64 {
+	return fc.currentOffset
+}
+
+func (fc *FileChannel) FlushOffset() uint64 {
+	return fc.position.Get()
+}
+
+func (fc *FileChannel) DiskUsage() (uint64, error) {
+	var total uint64
+	err := filepath.Walk(fc.dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !segmentFilePattern.MatchString(info.Name()) {
+			return nil
+		}
+		total += uint64(info.Size())
+		return nil
+	})
+	return total, err
 }

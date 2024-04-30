@@ -5,7 +5,7 @@ go 1.21.4
 require (
 	github.com/elliotchance/orderedmap/v2 v2.2.0
 	github.com/gofrs/flock v0.8.1
-	github.com/klauspost/compress v1.17.3
+	github.com/klauspost/compress v1.17.8
 	github.com/stretchr/testify v1.8.4
 )
 
