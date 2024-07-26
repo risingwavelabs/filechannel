@@ -16,6 +16,7 @@ package filechannel
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -32,8 +33,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/elliotchance/orderedmap/v2"
 	"github.com/gofrs/flock"
+	"github.com/ironpark/skiplist"
 	"github.com/klauspost/compress/snappy"
 
 	"github.com/risingwavelabs/filechannel/internal/condvar"
@@ -155,7 +156,7 @@ type Iterator struct {
 	autoAck         bool
 	readerIndex     uint32
 	pendingAckCount int
-	pendingAck      *orderedmap.OrderedMap[uint32, int]
+	pendingAck      skiplist.SkipList[uint32, int]
 
 	lastErr error
 	buf     *bytes.Buffer
@@ -294,7 +295,7 @@ func (it *Iterator) readNext() ([]byte, error) {
 	}
 
 	it.pendingAckCount++
-	it.pendingAck.Set(it.segmentIndex, it.pendingAck.GetOrDefault(it.segmentIndex, 0)+1)
+	it.pendingAck.Set(it.segmentIndex, getOrDefault(it.pendingAck, it.segmentIndex, 0)+1)
 	it.offset += uint64(MessageHeaderBinarySize) + uint64(it.buf.Len())
 	msg := it.buf.Bytes()
 
@@ -320,7 +321,7 @@ func (it *Iterator) Ack(n int) error {
 	for n > 0 {
 		if n >= f.Value {
 			n -= f.Value
-			it.pendingAck.Delete(f.Key)
+			it.pendingAck.Remove(f.Key())
 			f = it.pendingAck.Front()
 		} else {
 			f.Value -= n
@@ -330,7 +331,7 @@ func (it *Iterator) Ack(n int) error {
 
 	curSegmentIndex := it.segmentIndex
 	if f != nil {
-		curSegmentIndex = f.Key
+		curSegmentIndex = f.Key()
 	}
 
 	if curSegmentIndex > it.readerIndex {
@@ -444,7 +445,7 @@ func NewIterator(manager *SegmentManager, position *Position, autoAck bool) *Ite
 		readerIndex:    reader,
 		buf:            bytes.NewBuffer(make([]byte, 0, 4096)),
 		autoAck:        autoAck,
-		pendingAck:     orderedmap.NewOrderedMap[uint32, int](),
+		pendingAck:     skiplist.New[uint32, int](cmp.Compare[uint32]),
 	}
 }
 
@@ -512,8 +513,8 @@ type SegmentManager struct {
 
 	readMu       sync.RWMutex
 	readCond     *condvar.Cond
-	pinFreq      *orderedmap.OrderedMap[uint32, int]
-	readFreq     *orderedmap.OrderedMap[uint32, int]
+	pinFreq      skiplist.SkipList[uint32, int]
+	readFreq     skiplist.SkipList[uint32, int]
 	maxReadIndex int64
 	watermark    uint32
 }
@@ -531,7 +532,7 @@ func (sm *SegmentManager) NewReader() uint32 {
 	defer sm.readMu.Unlock()
 
 	beginIndex := sm.watermark
-	sm.readFreq.Set(beginIndex, sm.readFreq.GetOrDefault(beginIndex, 0)+1)
+	sm.readFreq.Set(beginIndex, getOrDefault(sm.readFreq, beginIndex, 0)+1)
 	return beginIndex
 }
 
@@ -540,7 +541,7 @@ func (sm *SegmentManager) Pin(index uint32) bool {
 	defer sm.readMu.Unlock()
 
 	if index >= sm.watermark {
-		sm.pinFreq.Set(index, sm.pinFreq.GetOrDefault(index, 0)+1)
+		sm.pinFreq.Set(index, getOrDefault(sm.pinFreq, index, 0)+1)
 		return true
 	}
 
@@ -551,14 +552,14 @@ func (sm *SegmentManager) Unpin(index uint32) {
 	sm.readMu.Lock()
 	defer sm.readMu.Unlock()
 
-	v, ok := sm.pinFreq.Get(index)
+	v, ok := sm.pinFreq.GetValue(index)
 	if !ok {
 		panic("unpin non-existing segment")
 	}
-	isFront := sm.pinFreq.Front().Key == index
+	isFront := sm.pinFreq.Front().Key() == index
 
 	if v == 1 {
-		sm.pinFreq.Delete(index)
+		sm.pinFreq.Remove(index)
 	} else {
 		sm.pinFreq.Set(index, v-1)
 	}
@@ -576,11 +577,11 @@ func (sm *SegmentManager) updateWatermark() {
 	if readFreqEmpty && pinFreqEmpty {
 		sm.watermark = uint32(sm.maxReadIndex + 1)
 	} else if readFreqEmpty {
-		sm.watermark = sm.pinFreq.Front().Key
+		sm.watermark = sm.pinFreq.Front().Key()
 	} else if pinFreqEmpty {
-		sm.watermark = sm.readFreq.Front().Key
+		sm.watermark = sm.readFreq.Front().Key()
 	} else {
-		sm.watermark = min(sm.pinFreq.Front().Key, sm.readFreq.Front().Key)
+		sm.watermark = min(sm.pinFreq.Front().Key(), sm.readFreq.Front().Key())
 	}
 
 	if prevWatermark != sm.watermark {
@@ -592,21 +593,21 @@ func (sm *SegmentManager) AdvanceReader(prev uint32, delta uint32) (uint32, uint
 	sm.readMu.Lock()
 	defer sm.readMu.Unlock()
 
-	v, ok := sm.readFreq.Get(prev)
+	v, ok := sm.readFreq.GetValue(prev)
 	if !ok {
 		panic("advancing a non-existing reader")
 	}
-	isFront := sm.readFreq.Front().Key == prev
+	isFront := sm.readFreq.Front().Key() == prev
 
 	if v == 1 {
-		sm.readFreq.Delete(prev)
+		sm.readFreq.Remove(prev)
 	} else {
 		sm.readFreq.Set(prev, v-1)
 	}
 
 	next := prev + delta
 	sm.maxReadIndex = max(int64(next-1), sm.maxReadIndex)
-	sm.readFreq.Set(next, sm.readFreq.GetOrDefault(next, 0)+1)
+	sm.readFreq.Set(next, getOrDefault(sm.readFreq, next, 0)+1)
 
 	// If the minimum reader index is deleted, there's a chance to
 	// advance the watermark.
@@ -621,14 +622,14 @@ func (sm *SegmentManager) CloseReader(cur uint32) uint32 {
 	sm.readMu.Lock()
 	defer sm.readMu.Unlock()
 
-	v, ok := sm.readFreq.Get(cur)
+	v, ok := sm.readFreq.GetValue(cur)
 	if !ok {
 		panic("closing a non-existing reader")
 	}
-	isFront := sm.readFreq.Front().Key == cur
+	isFront := sm.readFreq.Front().Key() == cur
 
 	if v == 1 {
-		sm.readFreq.Delete(cur)
+		sm.readFreq.Remove(cur)
 	} else {
 		sm.readFreq.Set(cur, v-1)
 	}
@@ -724,8 +725,8 @@ func (sm *SegmentManager) IncSegmentIndex() uint32 {
 func NewSegmentManager(dir string) *SegmentManager {
 	sm := &SegmentManager{
 		dir:          dir,
-		readFreq:     orderedmap.NewOrderedMap[uint32, int](),
-		pinFreq:      orderedmap.NewOrderedMap[uint32, int](),
+		readFreq:     skiplist.New[uint32, int](cmp.Compare[uint32]),
+		pinFreq:      skiplist.New[uint32, int](cmp.Compare[uint32]),
 		maxReadIndex: -1,
 	}
 	cond := condvar.NewCond(sm.readMu.RLocker())
