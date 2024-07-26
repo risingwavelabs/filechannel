@@ -21,6 +21,15 @@ import (
 	"github.com/risingwavelabs/filechannel/internal/filechannel"
 )
 
+// Errors.
+var (
+	ErrUnexpectedEOF      = filechannel.ErrUnexpectedEOF
+	ErrChecksumMismatch   = filechannel.ErrChecksumMismatch
+	ErrChannelClosed      = filechannel.ErrChannelClosed
+	ErrNotEnoughMessages  = filechannel.ErrNotEnoughMessages
+	ErrNotEnoughReadToAck = filechannel.ErrNotEnoughReadToAck
+)
+
 // Sender sends bytes to file channel.
 type Sender interface {
 	SenderStats
