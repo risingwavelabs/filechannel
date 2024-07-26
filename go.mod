@@ -3,7 +3,6 @@ module github.com/risingwavelabs/filechannel
 go 1.21.4
 
 require (
-	github.com/elliotchance/orderedmap/v2 v2.2.0
 	github.com/gofrs/flock v0.8.1
 	github.com/ironpark/skiplist v0.0.0-20230103051251-d63941a7d606
 	github.com/klauspost/compress v1.17.8
