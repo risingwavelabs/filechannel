@@ -43,7 +43,6 @@ import (
 )
 
 var (
-	ErrUnexpectedEOF      = fmt.Errorf("unexpected EOF")
 	ErrChecksumMismatch   = errors.New("channel corrupted: checksum mismatch")
 	ErrChannelClosed      = errors.New("channel closed")
 	ErrNotEnoughMessages  = errors.New("not enough messages")
@@ -182,7 +181,8 @@ func (it *Iterator) openCompressedFile() error {
 		return err
 	}
 	var buf [SegmentHeaderBinarySize]byte
-	if _, err = f.Read(buf[:]); err != nil {
+
+	if _, err = io.ReadFull(f, buf[:]); err != nil {
 		err1 := f.Close()
 		return errors.Join(err, err1)
 	}
@@ -206,7 +206,7 @@ func (it *Iterator) openPlainFile() error {
 		return err
 	}
 	var buf [SegmentHeaderBinarySize]byte
-	if _, err = f.Read(buf[:]); err != nil {
+	if _, err = io.ReadFull(f, buf[:]); err != nil {
 		err1 := f.Close()
 		return errors.Join(err, err1)
 	}
@@ -247,16 +247,13 @@ func (it *Iterator) ensure() error {
 	return nil
 }
 
+// ReadNext reads the next message from the reader. If any error occurs, it
+// returns immediately. If the message isn't fully read, it returns io.ErrUnexpectedEOF.
+// If the checksum doesn't match, it returns ErrChecksumMismatch.
+// It will return io.EOF if and only if no bytes were read.
 func ReadNext(r io.Reader, w io.Writer, hBuf []byte) error {
-	n, err := io.ReadFull(r, hBuf[:])
+	_, err := io.ReadFull(r, hBuf[:])
 	if err != nil {
-		if err == io.EOF {
-			if n == 0 {
-				return io.EOF
-			} else {
-				return ErrUnexpectedEOF
-			}
-		}
 		return err
 	}
 	h := &MessageHeader{}
@@ -266,8 +263,11 @@ func ReadNext(r io.Reader, w io.Writer, hBuf []byte) error {
 	if buf, ok := w.(*bytes.Buffer); ok {
 		buf.Grow(int(h.Length))
 		start := buf.Len()
-		_, err = io.CopyN(buf, r, int64(h.Length))
+		n, err := io.CopyN(buf, r, int64(h.Length))
 		if err != nil {
+			if errors.Is(err, io.EOF) && n < int64(h.Length) {
+				return io.ErrUnexpectedEOF
+			}
 			return err
 		}
 		if crc32.ChecksumIEEE(buf.Bytes()[start:]) != h.Checksum {
@@ -275,8 +275,11 @@ func ReadNext(r io.Reader, w io.Writer, hBuf []byte) error {
 		}
 	} else {
 		cw := utils.NewChecksumWriter(w)
-		_, err = io.CopyN(cw, r, int64(h.Length))
+		n, err := io.CopyN(cw, r, int64(h.Length))
 		if err != nil {
+			if errors.Is(err, io.EOF) && n < int64(h.Length) {
+				return io.ErrUnexpectedEOF
+			}
 			return err
 		}
 
@@ -285,7 +288,7 @@ func ReadNext(r io.Reader, w io.Writer, hBuf []byte) error {
 		}
 	}
 
-	return err
+	return nil
 }
 
 func (it *Iterator) readNext() ([]byte, error) {
@@ -812,7 +815,7 @@ func readCompressedSegmentHeader(file string) (CompressedSegmentHeader, error) {
 	defer f.Close()
 
 	var hBuf [SegmentHeaderBinarySize]byte
-	_, err = f.Read(hBuf[:])
+	_, err = io.ReadFull(f, hBuf[:])
 	if err != nil {
 		return CompressedSegmentHeader{}, err
 	}
@@ -831,7 +834,7 @@ func repairPlainSegment(file string) (PlainSegmentHeader, uint64, error) {
 	defer f.Close()
 
 	var hBuf [SegmentHeaderBinarySize]byte
-	_, err = f.Read(hBuf[:])
+	_, err = io.ReadFull(f, hBuf[:])
 	if err != nil {
 		return PlainSegmentHeader{}, 0, err
 	}
@@ -853,7 +856,7 @@ func repairPlainSegment(file string) (PlainSegmentHeader, uint64, error) {
 	}
 
 	lastOffset := lastReadCount + uint64(msgCnt*MessageHeaderBinarySize)
-	if errors.Is(err, ErrUnexpectedEOF) || errors.Is(err, ErrChecksumMismatch) {
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrChecksumMismatch) {
 		// Truncate to the last offset.
 		err := os.Truncate(file, int64(lastOffset)+SegmentHeaderBinarySize)
 		if err != nil {
@@ -1056,7 +1059,7 @@ func (fc *FileChannel) compress(ctx context.Context, index uint32) error {
 	var buf [SegmentHeaderBinarySize]byte
 	// Read plain file header.
 	plainHeader := PlainSegmentHeader{}
-	if _, err := f.Read(buf[:]); err != nil {
+	if _, err := io.ReadFull(f, buf[:]); err != nil {
 		return fmt.Errorf("failed to read plain segment header: %w", err)
 	}
 	plainHeader.Decode(buf[:])

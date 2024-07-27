@@ -23,7 +23,6 @@ import (
 
 // Errors.
 var (
-	ErrUnexpectedEOF      = filechannel.ErrUnexpectedEOF
 	ErrChecksumMismatch   = filechannel.ErrChecksumMismatch
 	ErrChannelClosed      = filechannel.ErrChannelClosed
 	ErrNotEnoughMessages  = filechannel.ErrNotEnoughMessages
