@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
 	"testing"
 	"time"
 )
@@ -61,6 +62,23 @@ func TestRegressionUnexpectedOverwritten(t *testing.T) {
 
 		if stat.Size() != SegmentHeaderBinarySize {
 			t.Fatalf("segment file size wasn't correctly truncated, size now is %d", stat.Size())
+		}
+
+		err = fc.Write(magicPayload(4096))
+		if err != nil {
+			t.Fatalf("failed to write payload: %s", err)
+		}
+		err = fc.Flush()
+		if err != nil {
+			t.Fatalf("failed to flush: %s", err)
+		}
+
+		data, err := fc.Iterator().Next(nil)
+		if err != nil {
+			t.Fatalf("failed to read next: %s", err)
+		}
+		if !slices.Equal(data, magicPayload(4096)) {
+			t.Fatalf("data mismatch")
 		}
 	}()
 
