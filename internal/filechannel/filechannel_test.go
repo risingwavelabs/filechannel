@@ -247,6 +247,29 @@ func TestFileChannel_ReadCompressed(t *testing.T) {
 	assert.NoError(t, it.Close())
 }
 
+func TestFileChannel_ReadCompressed_Gzip(t *testing.T) {
+	fc := setup(t, "test_file_channel_read_compressed_gzip", RotateThreshold(1<<20), WithCompressionMethod(Gzip))
+	defer teardown(t, fc, true)
+
+	const payloadSize, totalSize = 128, 10 << 20
+	msgNum := totalSize / payloadSize
+	payload := magicPayload(payloadSize)
+
+	writeAll(t, fc, func(_ int) []byte { return payload }, msgNum)
+
+	// Wait until the first segment is compressed.
+	checkFileChannelDir(t, fc.dir, func(entries []os.DirEntry) bool {
+		return slices.ContainsFunc(entries, func(entry os.DirEntry) bool {
+			return entry.Name() == "segment.0.z"
+		})
+	}, 10*time.Second)
+
+	it := fc.Iterator()
+	readAll(t, it, func(_ int) []byte { return payload }, msgNum, 10*time.Second)
+
+	assert.NoError(t, it.Close())
+}
+
 func TestFileChannel_ReadCompressed_HoldDeleted(t *testing.T) {
 	fc := setup(t, "test_file_channel_read_compressed", RotateThreshold(1<<20))
 	defer teardown(t, fc, true)

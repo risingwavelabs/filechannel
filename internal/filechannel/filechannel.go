@@ -17,6 +17,7 @@ package filechannel
 import (
 	"bytes"
 	"cmp"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -107,6 +108,7 @@ type CompressionMethod byte
 
 const (
 	Snappy CompressionMethod = iota
+	Gzip
 )
 
 type CompressedSegmentHeader struct {
@@ -195,7 +197,21 @@ func (it *Iterator) openCompressedFile() error {
 		return errors.Join(err, err1)
 	}
 
-	it.f, it.r = f, snappy.NewReader(f)
+	var r io.Reader
+	switch header.CompressionMethod {
+	case Snappy:
+		r = snappy.NewReader(f)
+	case Gzip:
+		r, err = gzip.NewReader(f)
+		if err != nil {
+			err1 := f.Close()
+			return errors.Join(err, err1)
+		}
+	default:
+		err1 := f.Close()
+		return errors.Join(errors.New("unsupported compression method"), err1)
+	}
+	it.f, it.r = f, r
 	return nil
 }
 
@@ -575,12 +591,13 @@ func (sm *SegmentManager) Unpin(index uint32) {
 func (sm *SegmentManager) updateWatermark() {
 	prevWatermark := sm.watermark
 
+	// Constraint: watermark <= min(readFreq.Front(), pinFreq.Front()) <= maxReadIndex + 1
 	readFreqEmpty := sm.readFreq.Len() == 0
 	pinFreqEmpty := sm.pinFreq.Len() == 0
 	if readFreqEmpty && pinFreqEmpty {
 		sm.watermark = uint32(sm.maxReadIndex + 1)
 	} else if readFreqEmpty {
-		sm.watermark = sm.pinFreq.Front().Key()
+		sm.watermark = min(sm.pinFreq.Front().Key(), uint32(sm.maxReadIndex+1))
 	} else if pinFreqEmpty {
 		sm.watermark = sm.readFreq.Front().Key()
 	} else {
@@ -756,6 +773,8 @@ type FileChannel struct {
 	beginOffset   uint64
 	currentOffset uint64
 	f             *fs.AppendableFile
+
+	compressionMethod CompressionMethod
 }
 
 var (
@@ -780,15 +799,23 @@ func RotateThreshold(n uint64) Option {
 	}
 }
 
+// WithCompressionMethod sets the compression method for the file channel.
+func WithCompressionMethod(method CompressionMethod) Option {
+	return func(channel *FileChannel) {
+		channel.compressionMethod = method
+	}
+}
+
 func NewFileChannel(dir string, opts ...Option) *FileChannel {
 	ctx, cancel := context.WithCancel(context.Background())
 	fc := &FileChannel{
-		dir:             dir,
-		segmentManager:  NewSegmentManager(dir),
-		flushInterval:   DefaultFlushInterval,
-		rotateThreshold: DefaultRotateThreshold,
-		bgCtx:           ctx,
-		bgCancel:        cancel,
+		dir:               dir,
+		segmentManager:    NewSegmentManager(dir),
+		flushInterval:     DefaultFlushInterval,
+		rotateThreshold:   DefaultRotateThreshold,
+		bgCtx:             ctx,
+		bgCancel:          cancel,
+		compressionMethod: Snappy,
 	}
 
 	for _, opt := range opts {
@@ -1012,7 +1039,10 @@ func (fc *FileChannel) Open() error {
 		cIdx := idx
 		go func() {
 			defer fc.bgWg.Done()
-			_ = fc.compress(fc.bgCtx, cIdx)
+			err = fc.compress(fc.bgCtx, cIdx)
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "failed to compress segment %d: %v\n", cIdx, err)
+			}
 		}()
 	}
 	fc.bgWg.Add(1)
@@ -1024,7 +1054,7 @@ func (fc *FileChannel) Open() error {
 	return nil
 }
 
-func (fc *FileChannel) compressInner(index uint32, from, to string) error {
+func (fc *FileChannel) compressInner(index uint32, from, to string, method CompressionMethod) error {
 	stats, err := os.Stat(from)
 	if err != nil {
 		return fmt.Errorf("failed to get stats of plain segment file: %w", err)
@@ -1056,7 +1086,7 @@ func (fc *FileChannel) compressInner(index uint32, from, to string) error {
 		SegmentID:         index,
 		BeginOffset:       plainHeader.BeginOffset,
 		EndOffset:         plainHeader.BeginOffset + uint64(stats.Size()-SegmentHeaderBinarySize),
-		CompressionMethod: Snappy,
+		CompressionMethod: method,
 	}
 	compressedHeader.Encode(buf[:])
 	_, err = wf.Write(buf[:])
@@ -1065,7 +1095,15 @@ func (fc *FileChannel) compressInner(index uint32, from, to string) error {
 	}
 
 	// Copy.
-	w := snappy.NewBufferedWriter(wf)
+	var w io.WriteCloser
+	switch method {
+	case Snappy:
+		w = snappy.NewBufferedWriter(wf)
+	case Gzip:
+		w = gzip.NewWriter(wf)
+	default:
+		panic("unsupported compression method")
+	}
 
 	_, err = io.Copy(w, f)
 	if err != nil {
@@ -1095,7 +1133,7 @@ func (fc *FileChannel) compress(ctx context.Context, index uint32) error {
 	compressingFile := fc.segmentManager.SegmentFile(index, Compressing)
 
 	// Compress.
-	err := fc.compressInner(index, plainFile, compressingFile)
+	err := fc.compressInner(index, plainFile, compressingFile, fc.compressionMethod)
 	if err != nil {
 		return fmt.Errorf("failed to compress: %w", err)
 	}
@@ -1252,8 +1290,10 @@ func (fc *FileChannel) rotate() error {
 		fc.bgWg.Add(1)
 		go func() {
 			defer fc.bgWg.Done()
-			// FIXME: log the error
-			_ = fc.compress(fc.bgCtx, curIndex-1)
+			err = fc.compress(fc.bgCtx, curIndex-1)
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "failed to compress segment %d: %v\n", curIndex-1, err)
+			}
 		}()
 	}
 

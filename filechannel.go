@@ -21,6 +21,15 @@ import (
 	"github.com/risingwavelabs/filechannel/internal/filechannel"
 )
 
+// CompressionMethod is the compression method used for the file channel.
+type CompressionMethod = filechannel.CompressionMethod
+
+// Compression methods.
+const (
+	Snappy CompressionMethod = filechannel.Snappy
+	Gzip                     = filechannel.Gzip
+)
+
 // Errors.
 var (
 	ErrChecksumMismatch   = filechannel.ErrChecksumMismatch
@@ -103,6 +112,7 @@ var (
 	DefaultFlushInterval   = filechannel.DefaultFlushInterval
 	RotateThreshold        = filechannel.RotateThreshold
 	FlushInterval          = filechannel.FlushInterval
+	WithCompressionMethod  = filechannel.WithCompressionMethod
 )
 
 // Compiler fence.
