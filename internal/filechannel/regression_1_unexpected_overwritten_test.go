@@ -73,6 +73,7 @@ func TestRegressionUnexpectedOverwritten(t *testing.T) {
 			t.Fatalf("failed to flush: %s", err)
 		}
 
+		// nolint:staticcheck
 		data, err := fc.Iterator().Next(nil)
 		if err != nil {
 			t.Fatalf("failed to read next: %s", err)

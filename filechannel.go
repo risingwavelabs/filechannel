@@ -47,6 +47,10 @@ type Receiver interface {
 	// Recv bytes from file channel.
 	Recv(context.Context) ([]byte, error)
 
+	// TryRecv tries to receive bytes from file channel without blocking.
+	// If there is no data available, it will return nil, ErrNotEnoughMessages.
+	TryRecv() ([]byte, error)
+
 	// Close closes the reader.
 	Close() error
 }
@@ -236,6 +240,11 @@ var _ ReceiverStats = &fileChannelReceiver{}
 
 type fileChannelReceiver struct {
 	inner *filechannel.Iterator
+}
+
+func (r *fileChannelReceiver) TryRecv() ([]byte, error) {
+	// nolint:staticcheck
+	return r.inner.Next(nil)
 }
 
 func (r *fileChannelReceiver) ReadOffset() uint64 {
