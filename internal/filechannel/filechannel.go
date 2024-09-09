@@ -244,9 +244,14 @@ func (it *Iterator) openPlainFile() error {
 }
 
 func (it *Iterator) openFile() error {
-	err := it.openCompressedFile()
+	// Open plain file first. If it's not found, then the compressed file must have been
+	// created. If the compressed file is not found, it's an error. Guaranteed by the
+	// compression algorithm:
+	//   rename(compressing, compressed)
+	//   delete(plain)
+	err := it.openPlainFile()
 	if os.IsNotExist(err) {
-		return it.openPlainFile()
+		return it.openCompressedFile()
 	}
 	return err
 }
