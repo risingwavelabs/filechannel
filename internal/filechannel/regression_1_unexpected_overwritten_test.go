@@ -25,8 +25,8 @@ func TestRegressionUnexpectedOverwritten(t *testing.T) {
 		t.Fatalf("failed to open file channel: %s", err)
 	}
 
-	// Write 4096 bytes, and it will be broken since there's a 8 bytes message header and exceeds the
-	// write buffer. Then the write buffer will be flushed to the disk, and left 8 trailing bytes in it.
+	// Write 4096 bytes, and it will be broken since there's an 8-byte message header and exceeds the
+	// write buffer. Then the write buffer will be flushed to the disk, and leave 8 trailing bytes in it.
 	err = fc.Write(magicPayload(4096))
 	if err != nil {
 		t.Fatalf("failed to write payload: %s", err)
