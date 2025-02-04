@@ -7,17 +7,20 @@ package example
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/risingwavelabs/filechannel"
 )
 
 func Example(dir string) error {
+	// Open a file channel.
 	fch, err := filechannel.OpenFileChannel(dir)
 	if err != nil {
 		return err
 	}
 	defer fch.Close()
 
+	// Send message to the channel.
 	msg := []byte("Hello world!")
 
 	tx := fch.Tx()
@@ -27,16 +30,27 @@ func Example(dir string) error {
 		return err
 	}
 
+	// Read message from the channel.
 	rx := fch.Rx()
 	defer rx.Close()
 	p, err := rx.Recv(context.Background())
 	if err != nil {
 		return err
 	}
+	// Output: Hello world!
+	fmt.Println(string(p))
+	
+	// Example of using range-loop to read messages from the channel.
+	// It will hang forever until the context is done.
+	for p, err := range filechannel.NewIteratorForReceiver(context.Background(), rx) {
+        if err != nil {
+            return err
+        }
+        fmt.Println(string(p))
+    }
 
 	return nil
 }
-
 ```
 
 ## Benchmarks
