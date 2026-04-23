@@ -257,12 +257,22 @@ func (it *Iterator) openFile() error {
 }
 
 func (it *Iterator) closeFile() error {
-	if it.f != nil {
-		err := it.f.Close()
-		it.f, it.r = nil, nil
-		return err
+	if it.f == nil {
+		return nil
 	}
-	return nil
+	var errs []error
+	// Close the decompression reader (if any) before the underlying file so
+	// that decoders like gzip can validate their trailer.
+	if c, ok := it.r.(io.Closer); ok && c != it.f {
+		if err := c.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := it.f.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	it.f, it.r = nil, nil
+	return errors.Join(errs...)
 }
 
 func (it *Iterator) ensure() error {
@@ -393,9 +403,8 @@ func (it *Iterator) Next(ctx context.Context) (b []byte, err error) {
 
 func (it *Iterator) tryNext(ctx context.Context) (b []byte, err error) {
 	defer func() {
-		//goland:noinspection GoDirectComparisonOfErrors
-		if err != nil && err != ErrNotEnoughMessages {
-			if ctx != nil && err == ctx.Err() {
+		if err != nil && !errors.Is(err, ErrNotEnoughMessages) {
+			if ctx != nil && errors.Is(err, ctx.Err()) {
 				return
 			}
 			it.lastErr = err
@@ -440,7 +449,7 @@ func (it *Iterator) tryNext(ctx context.Context) (b []byte, err error) {
 		b, err = it.readNext()
 
 		// Handle end of file: move to next segment.
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			if err := it.closeFile(); err != nil {
 				return nil, err
 			}
@@ -903,7 +912,7 @@ func repairPlainSegment(file string) (PlainSegmentHeader, uint64, error) {
 		if err != nil {
 			return PlainSegmentHeader{}, 0, fmt.Errorf("failed to truncate: %w", err)
 		}
-	} else if err != io.EOF {
+	} else if !errors.Is(err, io.EOF) {
 		// Unrecoverable.
 		return PlainSegmentHeader{}, 0, err
 	}
@@ -965,10 +974,16 @@ func (fc *FileChannel) unlock() error {
 	return fc.fileLock.Unlock()
 }
 
-func (fc *FileChannel) Open() error {
-	if err := fc.tryLock(); err != nil {
+func (fc *FileChannel) Open() (err error) {
+	if err = fc.tryLock(); err != nil {
 		return err
 	}
+	defer func() {
+		if err != nil {
+			_ = fc.unlock()
+			fc.fileLock = nil
+		}
+	}()
 
 	d, err := os.Open(fc.dir)
 	if err != nil {
@@ -1058,8 +1073,7 @@ func (fc *FileChannel) Open() error {
 		cIdx := idx
 		go func() {
 			defer fc.bgWg.Done()
-			err = fc.compress(fc.bgCtx, cIdx)
-			if err != nil {
+			if err := fc.compress(fc.bgCtx, cIdx); err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "failed to compress segment %d: %v\n", cIdx, err)
 			}
 		}()
@@ -1209,7 +1223,9 @@ func (fc *FileChannel) gcForIndex(index uint32) error {
 func (fc *FileChannel) gcOnce(watermark uint32) {
 	beginIndex := fc.segmentManager.GetBeginIndex()
 	for index := beginIndex; index < watermark; index++ {
-		_ = fc.gcForIndex(index)
+		if err := fc.gcForIndex(index); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "failed to gc segment %d: %v\n", index, err)
+		}
 	}
 	fc.segmentManager.SetBeginIndex(watermark)
 }
@@ -1229,13 +1245,14 @@ func (fc *FileChannel) gcLoop(ctx context.Context) {
 }
 
 func (fc *FileChannel) flushAndNotifyLoop(ctx context.Context) {
+	ticker := time.NewTicker(fc.flushInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(fc.flushInterval):
-			err := fc.flushAndNotifyWithLock()
-			if err != nil {
+		case <-ticker.C:
+			if err := fc.flushAndNotifyWithLock(); err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "failed to flush: %v\n", err)
 			}
 		}
@@ -1394,6 +1411,8 @@ func (fc *FileChannel) IteratorAcknowledgable() *Iterator {
 }
 
 func (fc *FileChannel) WriteOffset() uint64 {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
 	return fc.currentOffset
 }
 
