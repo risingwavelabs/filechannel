@@ -53,6 +53,55 @@ func Example(dir string) error {
 }
 ```
 
+## Receive buffer ownership
+
+Receivers created with `Rx` or `RxAck` return caller-owned message slices from
+`Recv`, `TryRecv`, and `NewIteratorForReceiver`. You can retain or modify them;
+later receives, acknowledgements, and closing the receiver do not change them.
+
+For performance-sensitive code, create a receiver with `Borrowed().Rx()` or
+`Borrowed().RxAck()` and use the same receive methods:
+
+```go
+rx := fch.Borrowed().Rx()
+defer rx.Close()
+p, err := rx.Recv(ctx) // Or TryRecv() without blocking.
+if err != nil {
+    return err
+}
+// Process p before calling another receive method on rx.
+fmt.Println(string(p))
+```
+
+`Borrowed()` returns a view of the same channel. It does not change existing
+receivers or the default ownership of receivers created directly from `fch`.
+The view itself needs no cleanup; close its receivers and the original channel
+as usual.
+
+Use `rx.IsBorrowed()` to check ownership through either the `Receiver` or
+`AckReceiver` interface. It returns `true` for receivers created through
+`Borrowed()` and `false` for receivers created directly from the channel.
+This property is fixed for the receiver's lifetime. For example, code receiving
+an arbitrary receiver can copy only when needed before retaining a message:
+
+```go
+p, err := rx.Recv(ctx)
+if err != nil {
+    return err
+}
+if rx.IsBorrowed() {
+    p = bytes.Clone(p) // Import "bytes".
+}
+// p is now owned by the caller.
+```
+
+Borrowed slices are read-only and valid only until the next receive call of any
+kind or `Close` on the same receiver, even if that call returns an error. `Ack`
+does not invalidate them. Copy a borrowed slice before retaining it or passing
+it to another goroutine. Receivers are not safe for concurrent use.
+When using `NewIteratorForReceiver` with a borrowed receiver, process or copy each
+message before the next iteration.
+
 ## Benchmarks
 
 Check benchmarks here [internal/filechannel/filechannel_benchmark_test.go](internal/filechannel/filechannel_benchmark_test.go).
