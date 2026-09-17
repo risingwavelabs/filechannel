@@ -56,8 +56,8 @@ type Receiver interface {
 
 	// Recv bytes from file channel. The returned slice is owned by the caller
 	// and may be retained or modified after subsequent receives, Ack, or Close.
-	// Receivers explicitly created with RxBorrowed or RxAckBorrowed instead
-	// return read-only borrowed slices with the lifetime documented by RxBorrowed.
+	// Receivers created through FileChannel.Borrowed instead return read-only
+	// borrowed slices with the lifetime documented by BorrowedFileChannel.
 	Recv(context.Context) ([]byte, error)
 
 	// TryRecv tries to receive bytes from file channel without blocking.
@@ -94,12 +94,11 @@ type FileChannel interface {
 	// Received slices are owned by the caller.
 	Rx() Receiver
 
-	// RxBorrowed creates a Receiver like Rx, but avoids copying message data.
-	// Recv and TryRecv return read-only slices backed by the receiver's buffer.
-	// Each slice is valid only until the next Recv, TryRecv, or Close call on
-	// that receiver, even if the call fails. Copy the data before retaining it
-	// or passing it to another goroutine. The receiver is not thread safe.
-	RxBorrowed() Receiver
+	// Borrowed returns a view for creating receivers that borrow message buffers.
+	// It shares this channel without changing existing receivers or the ownership
+	// of results from this channel's Rx and RxAck methods. The view does not need
+	// to be closed; Close on this channel controls the shared channel's lifetime.
+	Borrowed() BorrowedFileChannel
 
 	// Close the channel. Unclosed senders will block the method.
 	// Repeated calls return the result of the first Close.
@@ -116,11 +115,20 @@ type AckFileChannel interface {
 	// there also can be multiple AckReceiver at the same time.
 	// Received slices are owned by the caller.
 	RxAck() AckReceiver
+}
 
-	// RxAckBorrowed creates an AckReceiver like RxAck, but returns read-only
-	// borrowed slices with the same lifetime as FileChannel.RxBorrowed.
+// BorrowedFileChannel is a view for creating receivers that avoid copying message
+// data. Recv and TryRecv return read-only slices backed by each receiver's buffer.
+// Each slice is valid only until the next Recv, TryRecv, or Close call on that
+// receiver, even if the call fails. Copy the data before retaining it or passing
+// it to another goroutine. Each receiver is independent and is not thread safe.
+type BorrowedFileChannel interface {
+	// Rx creates a Receiver with borrowed results, like FileChannel.Rx otherwise.
+	Rx() Receiver
+
+	// RxAck creates an AckReceiver with borrowed results, like AckFileChannel.RxAck otherwise.
 	// Ack does not invalidate the slice.
-	RxAckBorrowed() AckReceiver
+	RxAck() AckReceiver
 }
 
 // Option to create a FileChannel.
@@ -208,8 +216,8 @@ func (f *fileChannel) Rx() Receiver {
 	return &fileChannelReceiver{inner: f.inner.Iterator()}
 }
 
-func (f *fileChannel) RxBorrowed() Receiver {
-	return &fileChannelReceiver{inner: f.inner.Iterator(), borrowed: true}
+func (f *fileChannel) Borrowed() BorrowedFileChannel {
+	return &borrowedFileChannel{channel: f}
 }
 
 func (f *fileChannel) RxAck() AckReceiver {
@@ -218,9 +226,20 @@ func (f *fileChannel) RxAck() AckReceiver {
 	}
 }
 
-func (f *fileChannel) RxAckBorrowed() AckReceiver {
+// Compiler fence.
+var _ BorrowedFileChannel = &borrowedFileChannel{}
+
+type borrowedFileChannel struct {
+	channel *fileChannel
+}
+
+func (f *borrowedFileChannel) Rx() Receiver {
+	return &fileChannelReceiver{inner: f.channel.inner.Iterator(), borrowed: true}
+}
+
+func (f *borrowedFileChannel) RxAck() AckReceiver {
 	return &fileChannelAckReceiver{
-		fileChannelReceiver{inner: f.inner.IteratorAcknowledgable(), borrowed: true},
+		fileChannelReceiver{inner: f.channel.inner.IteratorAcknowledgable(), borrowed: true},
 	}
 }
 

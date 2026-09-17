@@ -92,11 +92,15 @@ func TestBorrowedReceive(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, fc.Close()) })
 			tx := fc.Tx()
 			t.Cleanup(func() { require.NoError(t, tx.Close()) })
+			existingRx := fc.Rx()
+			t.Cleanup(func() { require.NoError(t, existingRx.Close()) })
 			var rx Receiver
 			if manualAck {
-				rx = fc.RxAckBorrowed()
+				var channel AckFileChannel = fc
+				rx = channel.Borrowed().RxAck()
 			} else {
-				rx = fc.RxBorrowed()
+				var channel FileChannel = fc
+				rx = channel.Borrowed().Rx()
 			}
 			t.Cleanup(func() { require.NoError(t, rx.Close()) })
 			ownedRx := fc.Rx()
@@ -133,6 +137,13 @@ func TestBorrowedReceive(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "other", string(otherOwned))
 			require.Equal(t, "first", string(owned))
+			// Creating the view also leaves receivers that already existed in owned mode.
+			existingFirst, err := existingRx.Recv(ctx)
+			require.NoError(t, err)
+			existingOther, err := existingRx.TryRecv()
+			require.NoError(t, err)
+			require.Equal(t, "first", string(existingFirst))
+			require.Equal(t, "other", string(existingOther))
 			if manualAck {
 				require.NoError(t, rx.(AckReceiver).Ack(2))
 			}

@@ -59,11 +59,11 @@ Receivers created with `Rx` or `RxAck` return caller-owned message slices from
 `Recv`, `TryRecv`, and `NewIteratorForReceiver`. You can retain or modify them;
 later receives, acknowledgements, and closing the receiver do not change them.
 
-For performance-sensitive code, create a receiver with `RxBorrowed` or
-`RxAckBorrowed` and use the same receive methods:
+For performance-sensitive code, create a receiver with `Borrowed().Rx()` or
+`Borrowed().RxAck()` and use the same receive methods:
 
 ```go
-rx := fch.RxBorrowed()
+rx := fch.Borrowed().Rx()
 defer rx.Close()
 p, err := rx.Recv(ctx) // Or TryRecv() without blocking.
 if err != nil {
@@ -72,6 +72,11 @@ if err != nil {
 // Process p before calling another receive method on rx.
 fmt.Println(string(p))
 ```
+
+`Borrowed()` returns a view of the same channel. It does not change existing
+receivers or the default ownership of receivers created directly from `fch`.
+The view itself needs no cleanup; close its receivers and the original channel
+as usual.
 
 Borrowed slices are read-only and valid only until the next receive call of any
 kind or `Close` on the same receiver, even if that call returns an error. `Ack`
