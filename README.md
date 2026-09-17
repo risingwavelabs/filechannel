@@ -78,6 +78,23 @@ receivers or the default ownership of receivers created directly from `fch`.
 The view itself needs no cleanup; close its receivers and the original channel
 as usual.
 
+Use `rx.IsBorrowed()` to check ownership through either the `Receiver` or
+`AckReceiver` interface. It returns `true` for receivers created through
+`Borrowed()` and `false` for receivers created directly from the channel.
+This property is fixed for the receiver's lifetime. For example, code receiving
+an arbitrary receiver can copy only when needed before retaining a message:
+
+```go
+p, err := rx.Recv(ctx)
+if err != nil {
+    return err
+}
+if rx.IsBorrowed() {
+    p = bytes.Clone(p) // Import "bytes".
+}
+// p is now owned by the caller.
+```
+
 Borrowed slices are read-only and valid only until the next receive call of any
 kind or `Close` on the same receiver, even if that call returns an error. `Ack`
 does not invalidate them. Copy a borrowed slice before retaining it or passing

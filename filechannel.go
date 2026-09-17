@@ -54,6 +54,11 @@ type Sender interface {
 type Receiver interface {
 	ReceiverStats
 
+	// IsBorrowed reports whether receive results have the read-only, borrowed
+	// lifetime documented by BorrowedFileChannel. If false, results are owned
+	// by the caller. The value is fixed when the receiver is created.
+	IsBorrowed() bool
+
 	// Recv bytes from file channel. The returned slice is owned by the caller
 	// and may be retained or modified after subsequent receives, Ack, or Close.
 	// Receivers created through FileChannel.Borrowed instead return read-only
@@ -122,6 +127,7 @@ type AckFileChannel interface {
 // Each slice is valid only until the next Recv, TryRecv, or Close call on that
 // receiver, even if the call fails. Copy the data before retaining it or passing
 // it to another goroutine. Each receiver is independent and is not thread safe.
+// Receivers created by this view report true from Receiver.IsBorrowed.
 type BorrowedFileChannel interface {
 	// Rx creates a Receiver with borrowed results, like FileChannel.Rx otherwise.
 	Rx() Receiver
@@ -300,6 +306,10 @@ var _ ReceiverStats = &fileChannelReceiver{}
 type fileChannelReceiver struct {
 	inner    *filechannel.Iterator
 	borrowed bool
+}
+
+func (r *fileChannelReceiver) IsBorrowed() bool {
+	return r.borrowed
 }
 
 func (r *fileChannelReceiver) TryRecv() ([]byte, error) {

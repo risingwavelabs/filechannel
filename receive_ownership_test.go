@@ -40,6 +40,7 @@ func TestReceiveOwnsResult(t *testing.T) {
 					rx = fc.Rx()
 				}
 				t.Cleanup(func() { require.NoError(t, rx.Close()) })
+				require.False(t, rx.IsBorrowed())
 				messages := [][]byte{[]byte("first"), []byte("other"), {}, bytes.Repeat([]byte("x"), (1<<20)+1), []byte("last")}
 				for _, msg := range messages {
 					require.NoError(t, tx.Send(context.Background(), msg))
@@ -79,6 +80,7 @@ func TestReceiveOwnsResult(t *testing.T) {
 				msg, err := rx.TryRecv()
 				require.ErrorIs(t, err, ErrNotEnoughMessages)
 				require.Nil(t, msg)
+				require.False(t, rx.IsBorrowed())
 			})
 		}
 	}
@@ -103,8 +105,11 @@ func TestBorrowedReceive(t *testing.T) {
 				rx = channel.Borrowed().Rx()
 			}
 			t.Cleanup(func() { require.NoError(t, rx.Close()) })
+			require.True(t, rx.IsBorrowed())
 			ownedRx := fc.Rx()
 			t.Cleanup(func() { require.NoError(t, ownedRx.Close()) })
+			require.False(t, ownedRx.IsBorrowed())
+			require.False(t, existingRx.IsBorrowed())
 			for _, msg := range []string{"first", "other", "final"} {
 				require.NoError(t, tx.Send(context.Background(), []byte(msg)))
 			}
@@ -155,6 +160,7 @@ func TestBorrowedReceive(t *testing.T) {
 			msg, err = rx.Recv(canceled)
 			require.ErrorIs(t, err, context.Canceled)
 			require.Nil(t, msg)
+			require.True(t, rx.IsBorrowed())
 		})
 	}
 }
