@@ -89,6 +89,7 @@ type FileChannel interface {
 	Rx() Receiver
 
 	// Close the channel. Unclosed senders will block the method.
+	// Repeated calls return the result of the first Close.
 	Close() error
 }
 
@@ -142,9 +143,7 @@ func (f *fileChannel) Close() error {
 		f.wRefCond.Wait()
 	}
 
-	err := f.inner.Close()
-	f.inner = nil
-	return err
+	return f.inner.Close()
 }
 
 func (f *fileChannel) writeOffset() uint64 {
@@ -181,7 +180,9 @@ func (f *fileChannel) closeTx() {
 	defer f.wRefLock.Unlock()
 
 	f.wRefCnt--
-	f.wRefCond.Signal()
+	if f.wRefCnt == 0 {
+		f.wRefCond.Broadcast()
+	}
 }
 
 func (f *fileChannel) Rx() Receiver {
