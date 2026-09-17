@@ -55,16 +55,17 @@ func Example(dir string) error {
 
 ## Receive buffer ownership
 
-`Recv`, `TryRecv`, and `NewIteratorForReceiver` return caller-owned message slices.
-You can retain or modify them; later receives, acknowledgements, and closing the
-receiver do not change them.
+Receivers created with `Rx` or `RxAck` return caller-owned message slices from
+`Recv`, `TryRecv`, and `NewIteratorForReceiver`. You can retain or modify them;
+later receives, acknowledgements, and closing the receiver do not change them.
 
-For performance-sensitive code, receivers created by this package (including
-`RxAck`) also implement `BorrowingReceiver`:
+For performance-sensitive code, create a receiver with `RxBorrowed` or
+`RxAckBorrowed` and use the same receive methods:
 
 ```go
-borrowed := rx.(filechannel.BorrowingReceiver)
-p, err := borrowed.RecvBorrowed(ctx) // Or TryRecvBorrowed() without blocking.
+rx := fch.RxBorrowed()
+defer rx.Close()
+p, err := rx.Recv(ctx) // Or TryRecv() without blocking.
 if err != nil {
     return err
 }
@@ -76,6 +77,8 @@ Borrowed slices are read-only and valid only until the next receive call of any
 kind or `Close` on the same receiver, even if that call returns an error. `Ack`
 does not invalidate them. Copy a borrowed slice before retaining it or passing
 it to another goroutine. Receivers are not safe for concurrent use.
+When using `NewIteratorForReceiver` with a borrowed receiver, process or copy each
+message before the next iteration.
 
 ## Benchmarks
 

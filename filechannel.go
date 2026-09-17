@@ -56,34 +56,17 @@ type Receiver interface {
 
 	// Recv bytes from file channel. The returned slice is owned by the caller
 	// and may be retained or modified after subsequent receives, Ack, or Close.
+	// Receivers explicitly created with RxBorrowed or RxAckBorrowed instead
+	// return read-only borrowed slices with the lifetime documented by RxBorrowed.
 	Recv(context.Context) ([]byte, error)
 
 	// TryRecv tries to receive bytes from file channel without blocking.
 	// If there is no data available, it will return nil, ErrNotEnoughMessages.
-	// The returned slice is owned by the caller, with the same lifetime as Recv.
+	// The returned slice has the same ownership and lifetime as Recv.
 	TryRecv() ([]byte, error)
 
 	// Close closes the reader.
 	Close() error
-}
-
-// BorrowingReceiver optionally exposes receives that avoid copying message data.
-// Receivers returned by this package's Rx and RxAck implement BorrowingReceiver;
-// callers can access it with a type assertion. Like Receiver, it is not thread safe.
-// Recv and TryRecv still return caller-owned results when used on this interface.
-type BorrowingReceiver interface {
-	Receiver
-
-	// RecvBorrowed receives a read-only slice backed by the receiver's buffer.
-	// It is valid only until the next call to Recv, TryRecv, RecvBorrowed,
-	// TryRecvBorrowed, or Close on the same receiver, even if that call fails.
-	// Copy the data before retaining it or passing it to another goroutine.
-	// Ack does not invalidate the slice.
-	RecvBorrowed(context.Context) ([]byte, error)
-
-	// TryRecvBorrowed is the nonblocking form of RecvBorrowed, with the same
-	// lifetime. It returns nil, ErrNotEnoughMessages when no data is available.
-	TryRecvBorrowed() ([]byte, error)
 }
 
 // AckReceiver receives bytes like Receiver. However, it doesn't
@@ -108,8 +91,15 @@ type FileChannel interface {
 	// However, it's possible to have multiple receivers at the same time.
 	// The first message received by each receiver is undetermined and
 	// leaved to implementation.
-	// Receivers created by this package also implement BorrowingReceiver.
+	// Received slices are owned by the caller.
 	Rx() Receiver
+
+	// RxBorrowed creates a Receiver like Rx, but avoids copying message data.
+	// Recv and TryRecv return read-only slices backed by the receiver's buffer.
+	// Each slice is valid only until the next Recv, TryRecv, or Close call on
+	// that receiver, even if the call fails. Copy the data before retaining it
+	// or passing it to another goroutine. The receiver is not thread safe.
+	RxBorrowed() Receiver
 
 	// Close the channel. Unclosed senders will block the method.
 	// Repeated calls return the result of the first Close.
@@ -124,8 +114,13 @@ type AckFileChannel interface {
 	// RxAck creates a AckReceiver. AckReceiver behaves the same as
 	// Receiver from [FileChannel.Rx] except the ack. Like Receiver,
 	// there also can be multiple AckReceiver at the same time.
-	// Receivers created by this package also implement BorrowingReceiver.
+	// Received slices are owned by the caller.
 	RxAck() AckReceiver
+
+	// RxAckBorrowed creates an AckReceiver like RxAck, but returns read-only
+	// borrowed slices with the same lifetime as FileChannel.RxBorrowed.
+	// Ack does not invalidate the slice.
+	RxAckBorrowed() AckReceiver
 }
 
 // Option to create a FileChannel.
@@ -210,12 +205,22 @@ func (f *fileChannel) closeTx() {
 }
 
 func (f *fileChannel) Rx() Receiver {
-	return &fileChannelReceiver{f.inner.Iterator()}
+	return &fileChannelReceiver{inner: f.inner.Iterator()}
+}
+
+func (f *fileChannel) RxBorrowed() Receiver {
+	return &fileChannelReceiver{inner: f.inner.Iterator(), borrowed: true}
 }
 
 func (f *fileChannel) RxAck() AckReceiver {
 	return &fileChannelAckReceiver{
-		fileChannelReceiver{f.inner.IteratorAcknowledgable()},
+		fileChannelReceiver{inner: f.inner.IteratorAcknowledgable()},
+	}
+}
+
+func (f *fileChannel) RxAckBorrowed() AckReceiver {
+	return &fileChannelAckReceiver{
+		fileChannelReceiver{inner: f.inner.IteratorAcknowledgable(), borrowed: true},
 	}
 }
 
@@ -271,23 +276,18 @@ func (s *fileChannelSender) Send(ctx context.Context, p []byte) error {
 
 // Compiler fence.
 var _ Receiver = &fileChannelReceiver{}
-var _ BorrowingReceiver = &fileChannelReceiver{}
 var _ ReceiverStats = &fileChannelReceiver{}
 
 type fileChannelReceiver struct {
-	inner *filechannel.Iterator
+	inner    *filechannel.Iterator
+	borrowed bool
 }
 
 func (r *fileChannelReceiver) TryRecv() ([]byte, error) {
+	if r.borrowed {
+		return r.inner.TryNextBorrowed()
+	}
 	return r.inner.TryNext()
-}
-
-func (r *fileChannelReceiver) TryRecvBorrowed() ([]byte, error) {
-	return r.inner.TryNextBorrowed()
-}
-
-func (r *fileChannelReceiver) RecvBorrowed(ctx context.Context) ([]byte, error) {
-	return r.inner.NextBorrowed(ctx)
 }
 
 func (r *fileChannelReceiver) ReadOffset() uint64 {
@@ -299,12 +299,14 @@ func (r *fileChannelReceiver) Close() error {
 }
 
 func (r *fileChannelReceiver) Recv(ctx context.Context) ([]byte, error) {
+	if r.borrowed {
+		return r.inner.NextBorrowed(ctx)
+	}
 	return r.inner.Next(ctx)
 }
 
 // Compiler fence.
 var _ AckReceiver = &fileChannelAckReceiver{}
-var _ BorrowingReceiver = &fileChannelAckReceiver{}
 var _ ReceiverStats = &fileChannelAckReceiver{}
 
 type fileChannelAckReceiver struct {

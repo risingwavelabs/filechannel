@@ -94,46 +94,54 @@ func TestBorrowedReceive(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, tx.Close()) })
 			var rx Receiver
 			if manualAck {
-				rx = fc.RxAck()
+				rx = fc.RxAckBorrowed()
 			} else {
-				rx = fc.Rx()
+				rx = fc.RxBorrowed()
 			}
 			t.Cleanup(func() { require.NoError(t, rx.Close()) })
-			borrowed := rx.(BorrowingReceiver)
-			for _, msg := range []string{"owned", "first", "other", "final"} {
+			ownedRx := fc.Rx()
+			t.Cleanup(func() { require.NoError(t, ownedRx.Close()) })
+			for _, msg := range []string{"first", "other", "final"} {
 				require.NoError(t, tx.Send(context.Background(), []byte(msg)))
 			}
 			require.NoError(t, fc.flush())
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			owned, err := rx.Recv(ctx)
+			owned, err := ownedRx.Recv(ctx)
 			require.NoError(t, err)
-			first, err := borrowed.RecvBorrowed(ctx)
+			first, err := rx.Recv(ctx)
 			require.NoError(t, err)
 			require.Equal(t, "first", string(first))
 			if manualAck {
-				require.NoError(t, rx.(AckReceiver).Ack(2))
+				require.NoError(t, rx.(AckReceiver).Ack(1))
 				require.Equal(t, "first", string(first))
 			}
 			// Keep only the address to verify buffer reuse without reading an expired slice.
 			address := &first[0]
-			other, err := borrowed.TryRecvBorrowed()
+			other, err := rx.TryRecv()
 			require.NoError(t, err)
 			require.Equal(t, "other", string(other))
 			require.True(t, address == &other[0], "borrowed receives should reuse the buffer")
-			last, err := rx.TryRecv()
+			for last, err := range NewIteratorForReceiver(ctx, rx) {
+				require.NoError(t, err)
+				require.Equal(t, "final", string(last))
+				require.True(t, address == &last[0], "iteration should reuse the borrowed buffer")
+				break
+			}
+			// A borrowed receiver has its own cursor and does not change the default mode.
+			otherOwned, err := ownedRx.TryRecv()
 			require.NoError(t, err)
-			require.Equal(t, "final", string(last))
-			require.Equal(t, "owned", string(owned))
+			require.Equal(t, "other", string(otherOwned))
+			require.Equal(t, "first", string(owned))
 			if manualAck {
 				require.NoError(t, rx.(AckReceiver).Ack(2))
 			}
-			msg, err := borrowed.TryRecvBorrowed()
+			msg, err := rx.TryRecv()
 			require.ErrorIs(t, err, ErrNotEnoughMessages)
 			require.Nil(t, msg)
 			canceled, cancelNow := context.WithCancel(context.Background())
 			cancelNow()
-			msg, err = borrowed.RecvBorrowed(canceled)
+			msg, err = rx.Recv(canceled)
 			require.ErrorIs(t, err, context.Canceled)
 			require.Nil(t, msg)
 		})
