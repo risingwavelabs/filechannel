@@ -52,6 +52,7 @@ var (
 	ErrChannelClosed      = errors.New("channel closed")
 	ErrNotEnoughMessages  = errors.New("not enough messages")
 	ErrNotEnoughReadToAck = errors.New("not enough read to ack")
+	ErrAlreadyOpened      = errors.New("already opened")
 )
 
 type SegmentFileState int
@@ -777,6 +778,21 @@ func NewSegmentManager(dir string) *SegmentManager {
 	return sm
 }
 
+type channelState uint8
+
+const (
+	channelNew channelState = iota
+	channelOpen
+	channelClosing
+	channelClosed
+	channelFailed
+)
+
+type segmentWriter interface {
+	io.WriteCloser
+	Flush() error
+}
+
 type FileChannel struct {
 	dir            string
 	segmentManager *SegmentManager
@@ -786,16 +802,20 @@ type FileChannel struct {
 	flushInterval   time.Duration
 	rotateThreshold uint64
 
-	lastErr  error
-	closed   bool
 	bgCtx    context.Context
 	bgCancel context.CancelFunc
 	bgWg     sync.WaitGroup
 
+	// mu protects lifecycle state and all access to the active writer. Workers
+	// must be joined without holding it so a pending flush can finish.
 	mu            sync.Mutex
+	state         channelState
+	lastErr       error
+	closeErr      error
+	closeOnce     sync.Once
 	beginOffset   uint64
 	currentOffset uint64
-	f             *fs.AppendableFile
+	f             segmentWriter
 
 	compressionMethod CompressionMethod
 }
@@ -956,7 +976,7 @@ func (fc *FileChannel) probeWritingFileAndInit(lastIndex uint32, states []Segmen
 
 func (fc *FileChannel) tryLock() error {
 	if fc.fileLock != nil {
-		return errors.New("already opened")
+		return ErrAlreadyOpened
 	}
 	fileLock := flock.New(path.Join(fc.dir, "lock"))
 	locked, err := fileLock.TryLock()
@@ -971,19 +991,34 @@ func (fc *FileChannel) tryLock() error {
 }
 
 func (fc *FileChannel) unlock() error {
-	return fc.fileLock.Unlock()
+	if fc.fileLock == nil {
+		return nil
+	}
+	err := fc.fileLock.Unlock()
+	fc.fileLock = nil
+	return err
 }
 
+// Open initializes the channel and must only be called once per instance.
 func (fc *FileChannel) Open() (err error) {
-	if err = fc.tryLock(); err != nil {
-		return err
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.state != channelNew {
+		if fc.state == channelOpen {
+			return ErrAlreadyOpened
+		}
+		return fc.operationError()
 	}
 	defer func() {
 		if err != nil {
-			_ = fc.unlock()
-			fc.fileLock = nil
+			err = errors.Join(err, fc.closeWriter(), fc.unlock())
+			fc.fail(err)
+			fc.position = nil // Initialization failed; no readable channel exists.
 		}
 	}()
+	if err = fc.tryLock(); err != nil {
+		return err
+	}
 
 	d, err := os.Open(fc.dir)
 	if err != nil {
@@ -1062,6 +1097,7 @@ func (fc *FileChannel) Open() (err error) {
 		}
 	}
 
+	fc.state = channelOpen
 	// Start background tasks.
 	fc.bgWg.Add(1)
 	go func() {
@@ -1187,23 +1223,65 @@ func (fc *FileChannel) compress(ctx context.Context, index uint32) error {
 }
 
 func (fc *FileChannel) Close() error {
-	if fc.fileLock == nil {
-		return errors.New("not opened")
-	}
+	// Concurrent callers wait for the same shutdown and receive its result.
+	fc.closeOnce.Do(fc.close)
+	return fc.closeErr
+}
 
-	_ = fc.flushAndNotify()
-	fc.position.Close()
-
-	fc.closed = true
+func (fc *FileChannel) close() {
+	// Reject new operations before stopping the workers.
+	fc.mu.Lock()
+	fc.state = channelClosing
 	fc.bgCancel()
+	fc.mu.Unlock()
+
+	// A worker may be waiting for mu; let it finish before closing its writer.
 	fc.bgWg.Wait()
-	err := fc.f.Close()
-	fc.f = nil
 
-	_ = fc.unlock()
-	fc.fileLock = nil
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
 
-	return err
+	// Publish the final offset only if no earlier I/O operation failed.
+	err := fc.lastErr
+	if err == nil && fc.f != nil {
+		err = fc.flushAndNotify()
+	}
+	if fc.position != nil {
+		fc.position.Close()
+	}
+	fc.closeErr = errors.Join(err, fc.closeWriter(), fc.unlock())
+	fc.state = channelClosed
+}
+
+// The following lifecycle helpers require mu to be held.
+func (fc *FileChannel) closeWriter() error {
+	if fc.f == nil {
+		return nil
+	}
+	f := fc.f
+	fc.f = nil // Close invalidates the writer even when it returns an error.
+	return f.Close()
+}
+
+func (fc *FileChannel) operationError() error {
+	if fc.state == channelFailed {
+		return fc.lastErr
+	}
+	if fc.state != channelOpen {
+		return ErrChannelClosed
+	}
+	return nil
+}
+
+func (fc *FileChannel) fail(err error) {
+	if fc.lastErr == nil {
+		fc.lastErr = err
+	}
+	fc.state = channelFailed
+	fc.bgCancel()
+	if fc.position != nil {
+		fc.position.Close()
+	}
 }
 
 func forceRemoveFile(f string) error {
@@ -1253,7 +1331,13 @@ func (fc *FileChannel) flushAndNotifyLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := fc.flushAndNotifyWithLock(); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "failed to flush: %v\n", err)
+				// An I/O error has already marked the channel failed, saved the
+				// error, canceled workers, and woken readers. Write and Flush
+				// will return that error; Close will still release resources.
+				if !errors.Is(err, ErrChannelClosed) {
+					_, _ = fmt.Fprintf(os.Stderr, "failed to flush: %v\n", err)
+				}
+				return
 			}
 		}
 	}
@@ -1263,9 +1347,18 @@ func (fc *FileChannel) flushAndNotifyWithLock() error {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
-	return fc.flushAndNotify()
+	if err := fc.operationError(); err != nil {
+		return err
+	}
+	err := fc.flushAndNotify()
+	if err != nil {
+		fc.fail(err)
+	}
+	return err
 }
 
+// flushAndNotify requires mu and a live writer. Only complete, successful
+// writes may be published to readers.
 func (fc *FileChannel) flushAndNotify() error {
 	err := fc.f.Flush()
 	if err != nil {
@@ -1281,34 +1374,42 @@ func (fc *FileChannel) needsRotate() bool {
 }
 
 func (fc *FileChannel) createSegmentFile() error {
-	file := fc.segmentManager.SegmentFile(fc.segmentManager.CurrentSegmentIndex(), Plain)
-	f, err := fs.OpenAppendableFile(file, 0644)
+	f, err := fc.openSegmentFile(fc.segmentManager.CurrentSegmentIndex())
 	if err != nil {
 		return err
+	}
+	fc.beginOffset = fc.currentOffset
+	fc.f = f
+	return nil
+}
+
+func (fc *FileChannel) openSegmentFile(index uint32) (segmentWriter, error) {
+	file := fc.segmentManager.SegmentFile(index, Plain)
+	f, err := fs.OpenAppendableFile(file, 0644)
+	if err != nil {
+		return nil, err
 	}
 
 	// Write header.
 	var hBuf [SegmentHeaderBinarySize]byte
 	h := PlainSegmentHeader{
-		SegmentID:   fc.segmentManager.CurrentSegmentIndex(),
+		SegmentID:   index,
 		BeginOffset: fc.currentOffset,
 	}
 	h.Encode(hBuf[:])
 	_, err = f.Write(hBuf[:])
 	if err != nil {
 		err1 := f.Close()
-		return errors.Join(err, err1)
+		return nil, errors.Join(err, err1)
 	}
 
 	// Flush to persist.
 	if err := f.Flush(); err != nil {
 		err1 := f.Close()
-		return errors.Join(err, err1)
+		return nil, errors.Join(err, err1)
 	}
 
-	fc.beginOffset = fc.currentOffset
-	fc.f = f
-	return nil
+	return f, nil
 }
 
 func (fc *FileChannel) rotate() error {
@@ -1317,12 +1418,19 @@ func (fc *FileChannel) rotate() error {
 		return err
 	}
 
-	err = fc.f.Close()
+	err = fc.closeWriter()
 	if err != nil {
 		return err
 	}
 
 	curIndex := fc.segmentManager.CurrentSegmentIndex()
+	f, err := fc.openSegmentFile(curIndex + 1)
+	if err != nil {
+		return err
+	}
+	fc.f = f
+	fc.beginOffset = fc.currentOffset
+	fc.segmentManager.IncSegmentIndex()
 
 	// Seal the current one, and start compressing the previous one.
 	// This is an optimization to save CPU cost when throughput of reading
@@ -1333,33 +1441,17 @@ func (fc *FileChannel) rotate() error {
 		fc.bgWg.Add(1)
 		go func() {
 			defer fc.bgWg.Done()
-			err = fc.compress(fc.bgCtx, curIndex-1)
-			if err != nil {
+			if err := fc.compress(fc.bgCtx, curIndex-1); err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "failed to compress segment %d: %v\n", curIndex-1, err)
 			}
 		}()
 	}
 
-	fc.segmentManager.IncSegmentIndex()
-	return fc.createSegmentFile()
+	return nil
 }
 
 func (fc *FileChannel) Write(p []byte) (err error) {
-	defer func() {
-		if err != nil {
-			fc.lastErr = err
-		}
-	}()
-
-	if fc.lastErr != nil {
-		return fc.lastErr
-	}
-
-	if fc.closed {
-		return errors.New("closed")
-	}
-
-	// Construct header.
+	// Compute the checksum and encode the header without holding mu.
 	header := MessageHeader{
 		Length:   uint32(len(p)),
 		Checksum: crc32.ChecksumIEEE(p),
@@ -1369,6 +1461,14 @@ func (fc *FileChannel) Write(p []byte) (err error) {
 
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
+	if err := fc.operationError(); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			fc.fail(err)
+		}
+	}()
 
 	// If the segment size exceeds the threshold, seal and rotate to the next file.
 	if fc.needsRotate() {
@@ -1397,17 +1497,21 @@ func (fc *FileChannel) Flush() error {
 }
 
 func (fc *FileChannel) Iterator() *Iterator {
-	if fc.closed {
-		panic("file channel closed")
-	}
-	return NewIterator(fc.segmentManager, fc.position, true)
+	return fc.iterator(true)
 }
 
 func (fc *FileChannel) IteratorAcknowledgable() *Iterator {
-	if fc.closed {
-		panic("file channel closed")
+	return fc.iterator(false)
+}
+
+func (fc *FileChannel) iterator(autoAck bool) *Iterator {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	// A failed writer still has published data that receivers can drain.
+	if fc.position == nil || (fc.state != channelOpen && fc.state != channelFailed) {
+		panic(ErrChannelClosed)
 	}
-	return NewIterator(fc.segmentManager, fc.position, false)
+	return NewIterator(fc.segmentManager, fc.position, autoAck)
 }
 
 func (fc *FileChannel) WriteOffset() uint64 {
@@ -1417,6 +1521,9 @@ func (fc *FileChannel) WriteOffset() uint64 {
 }
 
 func (fc *FileChannel) FlushOffset() uint64 {
+	if fc.position == nil {
+		return 0
+	}
 	return fc.position.Get()
 }
 

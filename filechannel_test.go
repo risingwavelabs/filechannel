@@ -18,10 +18,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/risingwavelabs/filechannel/internal/utils"
 )
@@ -37,6 +41,133 @@ func mkdirTemp(t testingT) string {
 		t.FailNow()
 	}
 	return tmpDir
+}
+
+func TestRepeatedClose(t *testing.T) {
+	for _, failRotation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rotationFailure=%t", failRotation), func(t *testing.T) {
+			dir := t.TempDir()
+			fc, err := OpenFileChannel(dir, RotateThreshold(1))
+			if !assert.NoError(t, err) {
+				return
+			}
+			defer func() { _ = fc.Close() }()
+			tx := fc.Tx()
+			assert.NoError(t, tx.Send(context.Background(), []byte("buffered")))
+			var writeErr error
+			if failRotation {
+				assert.NoError(t, os.Mkdir(dir+"/segment.1", 0755))
+				writeErr = tx.Send(context.Background(), []byte("not written"))
+				assert.Error(t, writeErr)
+			}
+			assert.NoError(t, tx.Close())
+			for i := 0; i < 2; i++ {
+				if failRotation {
+					assert.ErrorIs(t, fc.Close(), writeErr)
+				} else {
+					assert.NoError(t, fc.Close())
+				}
+			}
+			assert.NotZero(t, fc.FlushOffset())
+		})
+	}
+}
+
+// closeWaitLocker reports when a closer releases the mutex in Cond.Wait.
+type closeWaitLocker struct {
+	sync.Locker
+	waiting chan struct{}
+}
+
+func (l closeWaitLocker) Unlock() {
+	l.Locker.Unlock()
+	l.waiting <- struct{}{}
+}
+
+func TestConcurrentCloseWaitsForSender(t *testing.T) {
+	for _, failRotation := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rotationFailure=%t", failRotation), func(t *testing.T) {
+			dir := t.TempDir()
+			fc, err := openFileChannel(dir, RotateThreshold(1))
+			require.NoError(t, err)
+			tx := fc.Tx()
+			var wg sync.WaitGroup
+			defer func() {
+				_ = tx.Close()
+				// Unblock all closers even if a regression makes the test fail.
+				fc.wRefCond.Broadcast()
+				wg.Wait()
+				_ = fc.Close()
+			}()
+
+			var writeErr error
+			if failRotation {
+				require.NoError(t, tx.Send(context.Background(), []byte("buffered")))
+				require.NoError(t, os.Mkdir(filepath.Join(dir, "segment.1"), 0755))
+				writeErr = tx.Send(context.Background(), []byte("not written"))
+				require.Error(t, writeErr)
+			}
+
+			waiting := make(chan struct{}, 2)
+			fc.wRefCond = sync.NewCond(closeWaitLocker{&fc.wRefLock, waiting})
+			closed := make(chan error, 2)
+			for i := 0; i < 2; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					closed <- fc.Close()
+				}()
+			}
+			for i := 0; i < 2; i++ {
+				select {
+				case <-waiting:
+				case <-time.After(5 * time.Second):
+					t.Fatal("Close did not wait for the sender")
+				}
+			}
+			require.NoError(t, tx.Close())
+			for i := 0; i < 2; i++ {
+				select {
+				case err := <-closed:
+					if failRotation {
+						require.ErrorIs(t, err, writeErr)
+					} else {
+						require.NoError(t, err)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("Close stayed blocked after the last sender closed")
+				}
+			}
+		})
+	}
+}
+
+func TestReceiversDrainAfterRotationFailure(t *testing.T) {
+	dir := t.TempDir()
+	fc, err := OpenAckFileChannel(dir, RotateThreshold(1), FlushInterval(time.Hour))
+	require.NoError(t, err)
+	defer func() { _ = fc.Close() }()
+	tx := fc.Tx()
+	defer func() { _ = tx.Close() }()
+	require.NoError(t, tx.Send(context.Background(), []byte("published")))
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "segment.1"), 0755))
+	writeErr := tx.Send(context.Background(), []byte("not written"))
+	require.Error(t, writeErr)
+
+	for _, rx := range []Receiver{fc.Rx(), fc.RxAck()} {
+		defer func() { _ = rx.Close() }()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		data, err := rx.Recv(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []byte("published"), data)
+		if ackRx, ok := rx.(AckReceiver); ok {
+			require.NoError(t, ackRx.Ack(1))
+		}
+		_, err = rx.Recv(ctx)
+		require.ErrorIs(t, err, ErrChannelClosed)
+	}
+	require.ErrorIs(t, tx.Send(context.Background(), nil), writeErr)
 }
 
 func TestFileChannel(t *testing.T) {
