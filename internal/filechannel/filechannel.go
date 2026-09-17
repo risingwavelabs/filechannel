@@ -52,7 +52,7 @@ var (
 	ErrChannelClosed      = errors.New("channel closed")
 	ErrNotEnoughMessages  = errors.New("not enough messages")
 	ErrNotEnoughReadToAck = errors.New("not enough read to ack")
-	errAlreadyOpened      = errors.New("already opened")
+	ErrAlreadyOpened      = errors.New("already opened")
 )
 
 type SegmentFileState int
@@ -976,7 +976,7 @@ func (fc *FileChannel) probeWritingFileAndInit(lastIndex uint32, states []Segmen
 
 func (fc *FileChannel) tryLock() error {
 	if fc.fileLock != nil {
-		return errAlreadyOpened
+		return ErrAlreadyOpened
 	}
 	fileLock := flock.New(path.Join(fc.dir, "lock"))
 	locked, err := fileLock.TryLock()
@@ -1005,7 +1005,7 @@ func (fc *FileChannel) Open() (err error) {
 	defer fc.mu.Unlock()
 	if fc.state != channelNew {
 		if fc.state == channelOpen {
-			return errAlreadyOpened
+			return ErrAlreadyOpened
 		}
 		return fc.operationError()
 	}
@@ -1521,8 +1521,6 @@ func (fc *FileChannel) WriteOffset() uint64 {
 }
 
 func (fc *FileChannel) FlushOffset() uint64 {
-	fc.mu.Lock()
-	defer fc.mu.Unlock()
 	if fc.position == nil {
 		return 0
 	}

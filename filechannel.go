@@ -36,6 +36,7 @@ var (
 	ErrChannelClosed      = filechannel.ErrChannelClosed
 	ErrNotEnoughMessages  = filechannel.ErrNotEnoughMessages
 	ErrNotEnoughReadToAck = filechannel.ErrNotEnoughReadToAck
+	ErrAlreadyOpened      = filechannel.ErrAlreadyOpened
 )
 
 // Sender sends bytes to file channel.

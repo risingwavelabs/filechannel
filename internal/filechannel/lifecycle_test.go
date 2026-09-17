@@ -33,7 +33,7 @@ func TestChannelLifecycle(t *testing.T) {
 	require.Zero(t, fc.FlushOffset())
 	require.Panics(t, func() { fc.Iterator() })
 	require.NoError(t, fc.Open())
-	require.ErrorIs(t, fc.Open(), errAlreadyOpened)
+	require.ErrorIs(t, fc.Open(), ErrAlreadyOpened)
 	require.NoError(t, fc.Write([]byte("last buffered message")))
 	wantOffset := fc.WriteOffset()
 	require.NoError(t, fc.Close())
