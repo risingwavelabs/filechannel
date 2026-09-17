@@ -327,7 +327,7 @@ func ReadNext(r io.Reader, w io.Writer, hBuf []byte) error {
 	return nil
 }
 
-func (it *Iterator) readNext() ([]byte, error) {
+func (it *Iterator) readNext(borrowed bool) ([]byte, error) {
 	err := ReadNext(it.r, it.buf, it.headerBuf[:])
 	if err != nil {
 		return nil, err
@@ -343,6 +343,9 @@ func (it *Iterator) readNext() ([]byte, error) {
 	if it.buf.Cap() > IteratorBufferLimit {
 		it.buf = bytes.NewBuffer(make([]byte, 0, IteratorBufferLimit))
 	} else {
+		if !borrowed {
+			msg = bytes.Clone(msg)
+		}
 		it.buf.Reset()
 	}
 
@@ -393,16 +396,30 @@ func (it *Iterator) waitForData(ctx context.Context) error {
 	return nil
 }
 
+// TryNext returns a caller-owned message without blocking.
 func (it *Iterator) TryNext() ([]byte, error) {
 	// nolint: staticcheck
-	return it.tryNext(nil)
+	return it.tryNext(nil, false)
 }
 
+// Next returns a caller-owned message that remains valid after further reads or Close.
 func (it *Iterator) Next(ctx context.Context) (b []byte, err error) {
-	return it.tryNext(ctx)
+	return it.tryNext(ctx, false)
 }
 
-func (it *Iterator) tryNext(ctx context.Context) (b []byte, err error) {
+// TryNextBorrowed is the nonblocking form of NextBorrowed.
+func (it *Iterator) TryNextBorrowed() ([]byte, error) {
+	// nolint: staticcheck
+	return it.tryNext(nil, true)
+}
+
+// NextBorrowed returns a read-only message valid only until the next call to any
+// Next or TryNext variant, or Close, even if that call returns an error.
+func (it *Iterator) NextBorrowed(ctx context.Context) ([]byte, error) {
+	return it.tryNext(ctx, true)
+}
+
+func (it *Iterator) tryNext(ctx context.Context, borrowed bool) (b []byte, err error) {
 	defer func() {
 		if err != nil && !errors.Is(err, ErrNotEnoughMessages) {
 			if ctx != nil && errors.Is(err, ctx.Err()) {
@@ -447,7 +464,7 @@ func (it *Iterator) tryNext(ctx context.Context) (b []byte, err error) {
 			panic("unexpected loop count")
 		}
 
-		b, err = it.readNext()
+		b, err = it.readNext(borrowed)
 
 		// Handle end of file: move to next segment.
 		if errors.Is(err, io.EOF) {

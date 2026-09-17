@@ -17,6 +17,7 @@ package filechannel
 import "context"
 
 // NewIteratorForReceiver creates an iterator for a receiver with a bound context.Context.
+// Each yielded message is owned by the caller, as with Receiver.Recv.
 func NewIteratorForReceiver(ctx context.Context, rx Receiver) func(func([]byte, error) bool) {
 	return func(yield func([]byte, error) bool) {
 		for {
